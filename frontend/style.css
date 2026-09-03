@@ -1,0 +1,240 @@
+:root {
+  --bg: #0f1420;
+  --panel: #171e2e;
+  --border: #263049;
+  --text: #dfe6f5;
+  --muted: #8b97b0;
+  --blue: #4f8cff;
+  --green: #35d0a5;
+  --scroll-thumb: #2c3856;
+}
+
+/* 浅色主题 */
+html[data-theme="light"] {
+  --bg: #f2f5fa;
+  --panel: #ffffff;
+  --border: #d7dee9;
+  --text: #1c2433;
+  --muted: #66738c;
+  --blue: #2f6fe4;
+  --green: #149e78;
+  --scroll-thumb: #b9c4d6;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* ---------- 定制滚动条（主题化） ---------- */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border-radius: 10px;
+  border: 2px solid var(--bg);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--blue); }
+::-webkit-scrollbar-corner { background: transparent; }
+/* Firefox 兼容 */
+* { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) transparent; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ---------- 全局禁止选中：仅输入框/文本域可选中复制 ---------- */
+body * {
+  user-select: none;
+  -webkit-user-select: none;
+}
+input,
+textarea,
+select {
+  user-select: text;
+  -webkit-user-select: text;
+}
+img {
+  -webkit-user-drag: none;
+  user-drag: none;
+}
+
+/* ---------- 无边框自定义标题栏 ---------- */
+.titlebar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  height: 40px;
+  padding-left: 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+  flex-shrink: 0;
+}
+.titlebar-brand { display: flex; align-items: center; gap: 10px; }
+.concurrency-badge { font-size: 11px; color: var(--muted); background: var(--border); padding: 1px 7px; border-radius: 10px; line-height: 1.5; white-space: nowrap; }
+.concurrency-badge:empty { display: none; }
+.titlebar-brand strong { font-size: 14px; font-weight: 600; color: var(--text); }
+.dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 8px var(--green);
+  animation: pulse 2s infinite;
+}
+@keyframes pulse { 50% { opacity: .4; } }
+
+.titlebar-actions { display: flex; height: 100%; }
+.titlebar-btn {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.titlebar-btn:hover { background: var(--border); color: var(--text); }
+.titlebar-btn.active { color: var(--blue); background: var(--border); }
+.titlebar-close:hover { background: #e81123 !important; color: #ffffff !important; }
+
+/* ---------- 工具栏 ---------- */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  flex-shrink: 0;
+}
+
+.meta { display: flex; align-items: center; gap: 12px; }
+/* 地址完整显示：去掉 max-width 截断，空间不够时才收缩 */
+.endpoint { color: var(--muted); font-size: 12px; white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: clip; }
+.toolbar-right { margin-left: auto; display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+
+/* ---------- 自绘下拉组件（替代原生 select）---------- */
+.dd { position: relative; user-select: none; }
+.dd-block { width: 100%; }
+.dd-btn {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; width: 100%; min-width: 110px;
+  background: var(--border); color: var(--text);
+  border: 1px solid transparent; border-radius: 6px;
+  padding: 6px 12px; font-size: 13px; cursor: pointer;
+}
+.dd-btn:hover { filter: brightness(1.2); }
+.dd.open .dd-btn { border-color: var(--blue); filter: none; }
+.dd-chevron { transition: transform .15s ease; color: var(--muted); flex-shrink: 0; }
+.dd.open .dd-chevron { transform: rotate(180deg); }
+.dd-list {
+  position: absolute; top: calc(100% + 4px); right: 0;
+  min-width: 100%; max-height: 260px; overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .3);
+  opacity: 0; transform: translateY(-4px); pointer-events: none;
+  transition: opacity .12s ease, transform .12s ease;
+  z-index: 60;
+}
+.dd.open .dd-list { opacity: 1; transform: translateY(0); pointer-events: auto; }
+.dd-item {
+  padding: 6px 10px; border-radius: 6px;
+  font-size: 13px; color: var(--muted); cursor: pointer; white-space: nowrap;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+}
+.dd-item:hover { background: var(--border); color: var(--text); }
+.dd-item.selected { color: var(--blue); font-weight: 600; background: var(--border); }
+/* 设置弹窗里列表从左侧展开（输入框宽度对齐） */
+.field .dd-list { right: auto; left: 0; }
+select, button {
+  background: var(--border); color: var(--text);
+  border: 1px solid transparent; border-radius: 6px;
+  padding: 6px 12px; font-size: 13px; cursor: pointer;
+}
+button:hover { filter: brightness(1.2); }
+#testStatus { color: var(--muted); font-size: 12px; min-width: 60px; }
+
+/* 主区域撑满视口剩余高度：固定区块约 285px，其余全部给图表画布。
+   间距统一用 --space：卡片间隙、区块间隙、页边距保持一致 */
+main { --space: 16px; padding: var(--space); display: flex; flex-direction: column; gap: var(--space); overflow-y: auto; flex: 1; min-height: 0; }
+
+.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.card {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px 18px;
+}
+.card-title { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+.card-value { font-size: 28px; font-weight: 700; color: var(--blue); }
+.card:nth-child(2) .card-value { color: var(--green); }
+/* 第三张卡片：与前两张保持统一字号和字重 */
+.card-value.small { font-size: 28px; font-weight: 700; display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.card-value.small .num-req { color: var(--blue); }
+.card-value.small .num-tok { color: var(--green); }
+.card-value.small .sep { color: var(--muted); font-weight: 400; }
+.card-value.small .num-req span,
+.card-value.small .num-tok span { font-size: 28px; font-weight: 700; }
+.card-value small { font-size: 11px; color: var(--muted); margin-left: 8px; font-weight: 400; }
+
+
+.chart-box {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px;
+  /* 图表盒子吃掉 main 里除卡片外的所有剩余高度，画布高度随窗口自适应 */
+  flex: 1; min-height: 0;
+  display: flex; flex-direction: column;
+}
+.chart-box h2 { font-size: 13px; color: var(--muted); font-weight: 500; margin-bottom: 8px; }
+.chart { width: 100%; flex: 1; min-height: 240px; }
+
+/* ---------- 设置弹窗 ---------- */
+.modal-mask {
+  position: fixed; inset: 0;
+  background: rgba(5, 10, 20, .55);
+  backdrop-filter: blur(3px);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 100;
+}
+.modal-mask.hidden { display: none; }
+.modal {
+  width: 540px; max-width: calc(100vw - 48px);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 20px 22px;
+  box-shadow: 0 12px 40px rgba(0,0,0,.35);
+}
+.modal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 16px;
+}
+.modal-head h2 { font-size: 15px; font-weight: 600; }
+.icon-btn {
+  background: var(--border); border: 1px solid transparent; color: var(--muted);
+  font-size: 15px; cursor: pointer; border-radius: 6px;
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 6px 8px; width: 33px; height: 33px; box-sizing: border-box;
+}
+.icon-btn:hover { color: var(--text); background: var(--border); filter: brightness(1.2); }
+
+.field { display: block; margin-top: 14px; }
+.field > span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+.field input, .field select {
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 7px 10px; font-size: 13px; outline: none;
+  width: 100%; /* 独立输入框（模型名 / API Key）占满整行 */
+}
+.field input:focus, .field select:focus { border-color: var(--blue); }
+.row { display: flex; gap: 10px; align-items: center; }
+/* 行内组合（端口/上游地址：输入框 + 按钮）：输入框拉长吃满剩余宽度 */
+.row > input { flex: 1; width: auto; min-width: 0; }
+.row > button { flex-shrink: 0; }
+.hint { display: block; margin-top: 6px; color: var(--muted); font-size: 11px; min-height: 14px; }
+.hint.ok { color: var(--green); }
+.hint.err { color: #ff6b6b; }

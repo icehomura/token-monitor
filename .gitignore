@@ -1,0 +1,41 @@
+# Runtime config (contains API keys and user-specific settings)
+token-monitor.json
+token-monitor.json.bak
+
+# Database
+token-monitor-data.db
+token-monitor-data.db-wal
+token-monitor-data.db-shm
+token-monitor-data.json
+token-monitor-data.json.bak
+
+# Rust build artifacts
+target/
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+
+# Tauri generated files
+gen/
+
+# OMC state files
+.omc/
+frontend/.omc/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Misc
+*.log
+.env
+.env.*
