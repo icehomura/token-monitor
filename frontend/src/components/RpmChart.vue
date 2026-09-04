@@ -7,6 +7,7 @@
 
 <script setup>
 import { ref, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import { fmtTokens } from '../utils/format'
 // echarts 按需导入，避免全量打包 ~1MB
 import * as echarts from 'echarts/core'
 import { BarChart, LineChart } from 'echarts/charts'
@@ -27,6 +28,7 @@ const props = defineProps({
   rpms: { type: Array, default: () => [] },
   tpms: { type: Array, default: () => [] },
   inputTpms: { type: Array, default: () => [] },
+  convertUnits: { type: Boolean, default: false },
 })
 
 const chartRef = ref(null)
@@ -91,9 +93,10 @@ function renderChart() {
               val = Math.round(p.value / outputScale)
               unit = '词元/分'
             }
+            const display = fmtTokens(val, props.convertUnits)
             s += `<div style="display:flex;align-items:center;gap:6px;margin:2px 0">`
             s += `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${color}"></span>`
-            s += `<span>${p.seriesName}：</span><b>${val}</b> <span style="color:#999">${unit}</span></div>`
+            s += `<span>${p.seriesName}：</span><b>${display}</b> <span style="color:#999">${unit}</span></div>`
           }
           return s
         },
@@ -110,12 +113,14 @@ function renderChart() {
           type: 'value', name: '输入词元 / RPM',
           nameTextStyle: { color: tc.label, align: 'left' },
           ...axis(),
+          axisLabel: { ...axis().axisLabel, formatter: v => fmtTokens(v, props.convertUnits) },
           splitLine: { lineStyle: { color: tc.split } },
         },
         {
           type: 'value', name: '输出词元',
           nameTextStyle: { color: tc.label, align: 'right' },
           ...axis(),
+          axisLabel: { ...axis().axisLabel, formatter: v => fmtTokens(v, props.convertUnits) },
           splitLine: { show: false },
         },
       ],
@@ -156,7 +161,7 @@ function renderChart() {
 
 watch(
   () =>
-    `${props.labels.join('|')}|${props.rpms.join(',')}|${props.tpms.join(',')}|${props.inputTpms.join(',')}|${themeColors.value.blue}`,
+    `${props.labels.join('|')}|${props.rpms.join(',')}|${props.tpms.join(',')}|${props.inputTpms.join(',')}|${themeColors.value.blue}|${props.convertUnits}`,
   () => {
     nextTick(() => renderChart())
   },

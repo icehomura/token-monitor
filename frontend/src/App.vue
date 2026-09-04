@@ -17,6 +17,7 @@
       :rpms="stats.rpms"
       :tpms="stats.tpms"
       :inputTpms="stats.inputTokensPerMin"
+      :convertUnits="convertUnits"
     />
   </section>
   <SettingsModal
