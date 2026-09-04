@@ -26,6 +26,11 @@
       @close="onDatePickerClose"
       @confirm="onDatePickerConfirm"
     />
+    <CopyApiModal
+      :visible="showCopyModal"
+      :port="serverPort"
+      @close="showCopyModal = false"
+    />
   </header>
 </template>
 
@@ -33,6 +38,7 @@
 import { ref, watch, computed, onMounted, onBeforeUnmount } from 'vue'
 import DdSelect from './DdSelect.vue'
 import DatePickerModal from './DatePickerModal.vue'
+import CopyApiModal from './CopyApiModal.vue'
 import IconButton from './base/IconButton.vue'
 import BaseButton from './base/BaseButton.vue'
 import { useTauri } from '../composables/useTauri'
@@ -61,6 +67,8 @@ const testStatus = ref('')
 const endpointText = ref('')
 const endpointTitle = ref('')
 const toolbarRef = ref(null)
+const showCopyModal = ref(false)
+const serverPort = ref(8188)
 
 const activeRangeText = computed(() => {
   if (selectedRange.value !== 'custom' || !confirmedRange.value) return ''
@@ -112,18 +120,12 @@ async function initInfo() {
     if (Array.isArray(info.endpoints)) {
       endpointTitle.value = '支持的接口：' + info.endpoints.join('  ·  ')
     }
+    serverPort.value = info.port || 8188
   } catch {}
 }
 
-async function copyEndpoint() {
-  try {
-    const info = await invoke('get_server_info')
-    await navigator.clipboard.writeText(info.endpoint)
-    testStatus.value = '已复制 ✓'
-  } catch {
-    testStatus.value = '复制失败'
-  }
-  setTimeout(() => { testStatus.value = '' }, 1500)
+function copyEndpoint() {
+  showCopyModal.value = true
 }
 
 async function sendTest() {
