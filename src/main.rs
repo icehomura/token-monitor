@@ -557,7 +557,7 @@ fn install_panic_hook() {
 fn install_seh_handler() {
     // 使用原始 FFI 而非 windows-sys 模块路径，避免版本差异
     #[repr(C)]
-    #[allow(dead_code, non_camel_case_types)]
+    #[allow(dead_code, non_camel_case_types, non_snake_case)]
     #[derive(Copy, Clone)]
     struct EXCEPTION_RECORD {
         ExceptionCode: u32,
@@ -568,7 +568,7 @@ fn install_seh_handler() {
         ExceptionInformation: [usize; 15],
     }
     #[repr(C)]
-    #[allow(non_camel_case_types)]
+    #[allow(non_camel_case_types, non_snake_case)]
     #[derive(Copy, Clone)]
     struct EXCEPTION_POINTERS {
         ExceptionRecord: *mut EXCEPTION_RECORD,
