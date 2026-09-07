@@ -262,7 +262,7 @@ onBeforeUnmount(() => {
 <style scoped>
 .codeg-dock {
   display: grid;
-  grid-template-columns: minmax(320px, 1.5fr) 1fr 1fr 1fr;
+  grid-template-columns: minmax(260px, 1.35fr) 1fr 1fr 1fr;
   gap: 12px;
   min-height: var(--codeg-bar-height, 240px);
   padding: 12px 16px;
@@ -288,7 +288,7 @@ onBeforeUnmount(() => {
   flex-direction: column;
   background: var(--bg);
 }
-.codeg-col-stats { width: 150%; }
+.codeg-col-stats { width: auto; min-width: 0; }
 .codeg-card-head {
   display: flex; align-items: center; justify-content: space-between;
   font-size: 12px; margin-bottom: 8px;
@@ -299,9 +299,12 @@ onBeforeUnmount(() => {
   background: var(--border); border-radius: 10px; padding: 2px 8px;
 }
 .codeg-stat-grid {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
   overflow: hidden;
   flex: 1;
+  align-content: start;
 }
 .res-card {
   display: flex; align-items: center; gap: 8px;
@@ -310,15 +313,17 @@ onBeforeUnmount(() => {
   border-radius: 6px;
   padding: 8px 10px;
   min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
 }
 .res-icon {
-  width: 30px; height: 30px; border-radius: 6px;
+  width: 28px; height: 28px; border-radius: 6px;
   display: flex; align-items: center; justify-content: center;
   flex-shrink: 0;
 }
-.res-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.res-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
 .res-label { font-size: 10px; color: var(--muted); }
-.res-value { font-size: 13px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.res-value { font-size: 12px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .res-sub { font-size: 10px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .codeg-session-list {
   overflow-y: auto; min-height: 0;
