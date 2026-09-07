@@ -40,14 +40,15 @@ defineProps({
   padding: 12px 16px;
   display: flex;
   flex-direction: column;
-  height: 136px;
+  height: auto;
+  min-height: 0;
   box-sizing: border-box;
   min-width: 0;
   overflow: visible;
 }
 .settings-card--auto {
   height: auto;
-  max-height: 260px;
+  max-height: none;
 }
 .card-label-wrap {
   flex-shrink: 0;
@@ -91,15 +92,15 @@ defineProps({
   align-items: stretch;
   justify-content: center;
   gap: 6px;
-  overflow-y: auto;
+  overflow: visible;
 }
 .card-main > * {
   flex-shrink: 0;
 }
 .settings-card--auto .card-main {
   justify-content: flex-start;
-  overflow-y: auto;
-  scrollbar-gutter: stable;
+  overflow: visible;
+  scrollbar-gutter: auto;
 }
 .card-hint {
   flex-shrink: 0;

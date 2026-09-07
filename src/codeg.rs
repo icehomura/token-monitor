@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 const CODEG_DEFAULT_PORT: u16 = 3080;
 const DEFAULT_POLL_SECS: u64 = 5;
@@ -70,6 +72,8 @@ pub struct CodegSessionSummary {
     pub status: String,
     pub agent_type: String,
     pub session_name: String,
+    /// ACP live_message 中最新文本，作为标题不足时的会话内容摘要。
+    pub latest_reply: String,
     /// 等待输入原因。Codeg 的 snapshot 中可能为 question / permission / plan_approval。
     pub waiting_for: Option<String>,
     pub idle_secs: u64,
@@ -89,6 +93,7 @@ pub struct SystemStats {
     pub gpu_percent: Option<f64>,
     pub c_drive_used_gb: f64,
     pub c_drive_total_gb: f64,
+    pub c_drive_free_gb: f64,
     pub c_drive_percent: f64,
     pub node_processes: u64,
     pub agent_processes: u64,
@@ -118,14 +123,14 @@ fn config() -> std::sync::RwLockReadGuard<'static, CodegConfig> {
     CONFIG
         .get_or_init(|| std::sync::RwLock::new(CodegConfig::default()))
         .read()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn update_config(cfg: CodegConfig) -> CodegConfig {
     *CONFIG
         .get_or_init(|| std::sync::RwLock::new(CodegConfig::default()))
         .write()
-        .unwrap() = cfg.clone();
+        .unwrap_or_else(|e| e.into_inner()) = cfg.clone();
     cfg
 }
 
@@ -215,14 +220,26 @@ async fn post_api<T: Serialize + ?Sized>(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
+#[allow(dead_code)]
 struct CodegConnection {
     id: String,
     agent_type: String,
     status: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    session_name: Option<String>,
+    #[serde(default)]
+    external_id: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Default)]
+#[allow(dead_code)]
 struct CodegSnapshot {
     #[serde(default)]
     external_id: Option<String>,
@@ -240,10 +257,51 @@ struct CodegSnapshot {
     live_message: Option<LiveMessageInfo>,
     #[serde(default)]
     usage: Option<UsageInfo>,
+    // 补充字段：CodeG snapshot 可能返回的会话名称相关字段
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    session_name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    project_path: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Default)]
-struct LiveMessageInfo {} // live turn 存在即视为有活动，无需具体字段
+struct LiveMessageInfo {
+    #[serde(default)]
+    content: Vec<LiveContentBlock>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum LiveContentBlock {
+    Text { text: String },
+    Thinking { text: String },
+    #[serde(other)]
+    Other,
+}
+
+impl LiveMessageInfo {
+    fn text(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|b| match b {
+                LiveContentBlock::Text { text } => Some(text.clone()),
+                LiveContentBlock::Thinking { text } => Some(text.clone()),
+                LiveContentBlock::Other => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string()
+    }
+}
 
 #[derive(Deserialize, Clone, Default)]
 struct UsageInfo {
@@ -283,28 +341,82 @@ fn last_activity_map() -> &'static Mutex<HashMap<String, (Instant, u64)>> {
     LAST_ACTIVITY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[derive(Deserialize, Clone, Default)]
+#[allow(dead_code)]
+struct CodegConversationTitle {
+    #[serde(default)]
+    id: Option<i32>,
+    #[serde(default)]
+    external_id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    session_name: Option<String>,
+}
+
+async fn fetch_conversation_titles() -> HashMap<String, String> {
+    let mut titles = HashMap::new();
+    if let Ok(v) = post_api(
+        "list_all_conversations",
+        &serde_json::json!({ "includeChildren": false }),
+    )
+    .await
+    {
+        let rows: Vec<CodegConversationTitle> =
+            serde_json::from_value(v).unwrap_or_default();
+        for row in rows {
+            let key = row.external_id.clone().unwrap_or_default();
+            let title = row
+                .title
+                .or(row.name)
+                .or(row.session_name)
+                .filter(|s| !s.trim().is_empty());
+            if !key.is_empty() {
+                if let Some(t) = title {
+                    titles.insert(key, t);
+                }
+            } else if let Some(id) = row.id {
+                if let Some(t) = title {
+                    titles.insert(id.to_string(), t);
+                }
+            }
+        }
+    }
+    titles
+}
+
 async fn fetch_session_summaries(
     recover: bool,
     events: &mut Vec<String>,
 ) -> Result<Vec<CodegSessionSummary>, String> {
+    let raw_conns = post_api("acp_list_connections", &serde_json::json!({})).await?;
+    // Debug: 打印原始连接列表 JSON，便于排查字段
+    if let Ok(pretty) = serde_json::to_string_pretty(&raw_conns) {
+        eprintln!("[codeg] connections list: {}", pretty);
+    }
     let conns: Vec<CodegConnection> =
-        serde_json::from_value(post_api("acp_list_connections", &serde_json::json!({})).await?)
+        serde_json::from_value(raw_conns)
             .map_err(|e| format!("解析 CodeG 连接列表失败：{e}"))?;
 
+    let title_map = fetch_conversation_titles().await;
     let mut summaries = Vec::with_capacity(conns.len());
     for c in conns {
+        // 1. 先获取 snapshot（拿到 external_id 用于匹配标题）
+        let mut snap = CodegSnapshot::default();
         let mut summary = CodegSessionSummary {
-            connection_id: c.id,
+            connection_id: c.id.clone(),
             status: c.status.clone(),
             agent_type: c.agent_type.clone(),
             session_name: String::new(),
+            latest_reply: String::new(),
             waiting_for: None,
             idle_secs: 0,
             last_activity_at: None,
             automatic_restart_count: 0,
             last_restart_reason: None,
         };
-        let mut snap = CodegSnapshot::default();
         if let Ok(v) = post_api(
             "acp_get_session_snapshot",
             &serde_json::json!({ "connectionId": summary.connection_id }),
@@ -312,20 +424,21 @@ async fn fetch_session_summaries(
         .await
         {
             if let Ok(s) = serde_json::from_value::<CodegSnapshot>(v) {
-                snap = s.clone();
-                summary.session_name = snap
-                    .external_id
-                    .as_deref()
-                    .map(str::to_string)
-                    .or_else(|| snap.agent_type.as_deref().map(str::to_string))
-                    .or_else(|| Some(summary.agent_type.clone()))
-                    .unwrap_or_default();
+                snap = s;
+                summary.latest_reply = snap.live_message.as_ref().map(|m| m.text()).unwrap_or_default();
                 if let Some(status) = snap.status.as_deref() {
                     summary.status = status.to_string();
                 }
                 summary.waiting_for = waiting_label(&snap);
             }
         }
+
+        // 2. 用 snapshot.external_id 匹配 list_all_conversations 的标题
+        summary.session_name = snap.external_id.as_deref()
+            .and_then(|eid| title_map.get(eid))
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| summary.agent_type.clone());
 
         // 错误状态：每次轮询发现就自动重试（cancel 后 prompt）。
         // 运行/连接中无输出：按不活跃阈值触发同样恢复。
@@ -348,7 +461,7 @@ async fn fetch_session_summaries(
                 true
             } else if is_running(&summary.status) {
                 // 锁只在该同步块内使用，避免 std MutexGuard 跨 await。
-                let mut map = last_activity_map().lock().unwrap();
+                let mut map = last_activity_map().lock().unwrap_or_else(|e| e.into_inner());
                 let now = Instant::now();
                 if active_now {
                     map.insert(summary.connection_id.clone(), (now, 0));
@@ -508,13 +621,19 @@ fn count_processes(names: &[&str]) -> u64 {
 }
 
 fn run_powershell(script: &str) -> Result<String, String> {
-    // Windows PowerShell 5.1 通过 -EncodedCommand 最稳定，但某些环境模块加载
-    // 会把文本折行；这里使用 -Command 加显式的 ConvertTo-Json 全名。
+    // 使用 CREATE_NO_WINDOW 标志彻底隐藏 PowerShell 窗口，
+    // -WindowStyle Hidden 在某些 Windows 版本上仍会短暂闪现。
+    #[cfg(target_os = "windows")]
+    const PS_FLAGS: u32 = windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+    #[cfg(not(target_os = "windows"))]
+    const PS_FLAGS: u32 = 0;
     let output = std::process::Command::new("powershell.exe")
+        .arg("-NoLogo")
         .arg("-NoProfile")
         .arg("-NonInteractive")
         .arg("-Command")
         .arg(script)
+        .creation_flags(PS_FLAGS)
         .output()
         .map_err(|e| format!("无法执行 powershell.exe：{e}"))?;
     if !output.status.success() {
@@ -526,7 +645,9 @@ fn run_powershell(script: &str) -> Result<String, String> {
 fn collect_resource_stats() -> SystemStats {
     // 一行 PowerShell 返回：cpu, usedMemBytes, totalMemBytes, cUsedBytes, cTotalBytes
     // 避免外层 shell 展开 `$`（Rust Command 不会展开，但保持脚本简单可靠）。
-    let script = "($cpu=(Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue|Measure-Object -Property LoadPercentage -Average).Average); $os=Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue; $total=[double]$os.TotalVisibleMemorySize*1KB; $free=[double]$os.FreePhysicalMemory*1KB; $drive=Get-PSDrive -Name C -ErrorAction SilentlyContinue; $cTotal=[double]($drive.Used+$drive.Free); $cUsed=[double]$drive.Used; Write-Output (\"{0} {1} {2} {3} {4}\" -f ($cpu -as [double]),($total-$free),$total,$cUsed,$cTotal)";
+    // 注意：不用 PowerShell -f 格式化操作符，中文 locale 下大数字会加千位分隔符
+    // （如 41,869,472），导致 Rust f64 解析失败返回 0。改用字符串插值。
+    let script = "$os=Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue; $cpu=(Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue|Measure-Object -Property LoadPercentage -Average).Average; $totalKB=[double]$os.TotalVisibleMemorySize; $freeKB=[double]$os.FreePhysicalMemory; $usedKB=$totalKB-$freeKB; $drive=Get-PSDrive -Name C -ErrorAction SilentlyContinue; $cUsed=[double]$drive.Used; $cTotal=[double]($drive.Used+$drive.Free); Write-Output \"$cpu $usedKB $totalKB $cUsed $cTotal\"";
     let out = match run_powershell(script) {
         Ok(out) => out,
         Err(_) => return SystemStats::default(),
@@ -546,20 +667,23 @@ fn collect_resource_stats() -> SystemStats {
     let gpu_hint = gpu_usage_gb();
     SystemStats {
         cpu_percent: cpu.round(),
-        memory_used_gb: (mem_used / 1024.0 / 1024.0 / 1024.0).round(),
-        memory_total_gb: (mem_total / 1024.0 / 1024.0 / 1024.0).round(),
+        // mem_used / mem_total 现在是 KB（不再是 bytes），除以 1024² 转 GB
+        memory_used_gb: (mem_used / 1024.0 / 1024.0 * 10.0).round() / 10.0,
+        memory_total_gb: (mem_total / 1024.0 / 1024.0 * 10.0).round() / 10.0,
         memory_percent: if mem_total > 0.0 {
-            (mem_used / mem_total * 100.0).round()
+            (mem_used / mem_total * 1000.0).round() / 10.0
         } else {
             0.0
         },
         gpu_used_gb: gpu_hint.0,
         gpu_total_gb: gpu_hint.1,
         gpu_percent: gpu_hint.2,
-        c_drive_used_gb: (c_used / 1024.0 / 1024.0 / 1024.0).round(),
-        c_drive_total_gb: (c_total / 1024.0 / 1024.0 / 1024.0).round(),
+        // c_used / c_total 现在是 bytes（来自 PSDrive），除以 1024³ 转 GB
+        c_drive_used_gb: (c_used / 1024.0 / 1024.0 / 1024.0 * 10.0).round() / 10.0,
+        c_drive_total_gb: (c_total / 1024.0 / 1024.0 / 1024.0 * 10.0).round() / 10.0,
+        c_drive_free_gb: ((c_total - c_used) / 1024.0 / 1024.0 / 1024.0 * 10.0).round() / 10.0,
         c_drive_percent: if c_total > 0.0 {
-            (c_used / c_total * 100.0).round()
+            (c_used / c_total * 1000.0).round() / 10.0
         } else {
             0.0
         },

@@ -1,5 +1,5 @@
 <template>
-  <div class="app-shell" :style="{ '--codeg-bar-height': codegBarVisible ? '44px' : '0px' }">
+  <div class="app-shell" :style="{ '--codeg-bar-height': codegBarVisible ? '180px' : '0px' }">
   <TitleBar
     :concurrency="stats.concurrency"
     @open-settings="showSettings = true"
@@ -63,6 +63,7 @@ const convertUnits = ref(getConvertUnits())
 const toolbarRef = ref(null)
 const codegBarVisible = ref(false)
 const BASE_WINDOW_HEIGHT = 640
+const CODEG_DOCK_HEIGHT = 180
 let baseWindowHeight = BASE_WINDOW_HEIGHT
 
 async function rememberWindowHeight() {
@@ -81,7 +82,7 @@ async function applyWindowHeight(showCodeg) {
   if (!win) return
   try {
     const width = (await win?.outerSize?.())?.width || 1100
-    const height = showCodeg ? baseWindowHeight + 44 : baseWindowHeight
+    const height = showCodeg ? baseWindowHeight + CODEG_DOCK_HEIGHT : baseWindowHeight
     await win?.setSize?.({ width, height })
   } catch {}
 }

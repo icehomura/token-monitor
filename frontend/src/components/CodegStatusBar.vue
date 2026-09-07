@@ -1,40 +1,84 @@
 <template>
-  <footer v-if="show" class="codeg-bar" :class="{ connected: status.connected, error: !!status.error }">
-    <template v-if="status.error">
-      <span class="codeg-item codeg-status">CodeG 未连接</span>
-      <span class="codeg-item codeg-err">{{ status.error }}</span>
-    </template>
+  <section v-if="show" class="codeg-dock" :class="{ error: !!status.error }">
+    <div v-if="status.error" class="codeg-error-banner">
+      <span class="dot"></span>
+      <span>CodeG 未连接</span>
+      <span class="codeg-err-text">{{ status.error }}</span>
+      <button class="codeg-refresh" @click="refresh">刷新</button>
+    </div>
+
     <template v-else>
-      <span class="codeg-item codeg-status">
-        <span class="dot"></span>
-        CodeG
-      </span>
-      <span class="codeg-item">会话 {{ status.session_count || 0 }}</span>
-      <span class="codeg-item codeg-running">运行 {{ status.running_count || 0 }}</span>
-      <span class="codeg-item codeg-stopped">停止 {{ status.stopped_count || 0 }}</span>
-      <span v-if="status.error_count > 0" class="codeg-item codeg-error">错误 {{ status.error_count || 0 }}</span>
-      <span class="codeg-item" :class="{ warn: status.waiting_input_count > 0 }">
-        等待输入 {{ status.waiting_input_count || 0 }}
-      </span>
-      <span class="codeg-item codeg-session" :title="status.active_session_name || ''">
-        当前 {{ status.active_session_name || '(无活跃会话)' }}
-      </span>
-      <span class="codeg-item codeg-proc">Node.js {{ status.system?.node_processes || 0 }}</span>
-      <span class="codeg-item codeg-proc">智能体 {{ status.system?.agent_processes || 0 }}</span>
-      <span class="codeg-item codeg-res">{{ fmtNum(status.system?.cpu_percent) }}% CPU</span>
-      <span class="codeg-item codeg-res">内存 {{ fmtNum(status.system?.memory_used_gb) }}/{{ fmtNum(status.system?.memory_total_gb) }}G</span>
-      <span v-if="status.system?.gpu_total_gb" class="codeg-item codeg-res">
-        GPU {{ fmtNum(status.system?.gpu_used_gb) }}/{{ fmtNum(status.system?.gpu_total_gb) }}G
-      </span>
-      <span class="codeg-item codeg-res">C盘 {{ fmtNum(status.system?.c_drive_percent) }}%</span>
-      <button v-if="!loading" class="codeg-refresh" title="刷新 CodeG 状态" @click="refresh">刷新</button>
-      <span v-if="loading" class="codeg-item codeg-loading">刷新中…</span>
+      <div class="codeg-col codeg-col-stats">
+        <div class="codeg-card-head">
+          <strong>系统资源</strong>
+          <span class="badge">刷新 {{ loading ? '中' : '5s' }}</span>
+        </div>
+        <div class="codeg-stat-grid">
+          <div class="stat-item">
+            <span class="stat-label">CPU</span>
+            <span class="stat-value">{{ fmtNum(status.system?.cpu_percent) }}%</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">内存</span>
+            <span class="stat-value">{{ fmtBytes(status.system?.memory_used_gb) }} / {{ fmtBytes(status.system?.memory_total_gb) }} ({{ fmtNum(status.system?.memory_percent) }}%)</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">GPU</span>
+            <span class="stat-value" v-if="status.system?.gpu_total_gb">{{ fmtBytes(status.system?.gpu_used_gb) }} / {{ fmtBytes(status.system?.gpu_total_gb) }} ({{ fmtNum(status.system?.gpu_percent) }}%)</span>
+            <span class="stat-value" v-else>—</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">C 盘</span>
+            <span class="stat-value">{{ fmtBytes(status.system?.c_drive_used_gb) }} / {{ fmtBytes(status.system?.c_drive_total_gb) }} ({{ fmtNum(status.system?.c_drive_percent) }}%)</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">进程</span>
+            <span class="stat-value">Node {{ status.system?.node_processes || 0 }} · Agent {{ status.system?.agent_processes || 0 }}</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="codeg-col codeg-col-active">
+        <div class="codeg-card-head">
+          <strong>活跃会话</strong>
+          <span class="badge">运行 {{ status.running_count || 0 }}</span>
+        </div>
+        <div class="codeg-session-list">
+          <div v-for="s in activeSessions" :key="s.connection_id" class="session-row">
+            <span class="session-state running">运行中</span>
+            <div class="session-main">
+              <div class="session-name" :title="sessionTitle(s)">{{ sessionTitle(s) }}</div>
+              <div v-if="s.latest_reply" class="session-preview" :title="s.latest_reply">{{ s.latest_reply }}</div>
+            </div>
+            <span class="session-meta">{{ statusLabel(s) }}</span>
+          </div>
+          <div v-if="!activeSessions.length" class="empty">暂无活跃会话</div>
+        </div>
+      </div>
+
+      <div class="codeg-col codeg-col-request">
+        <div class="codeg-card-head">
+          <strong>请求 / 等待输入</strong>
+          <span class="badge">等待 {{ status.waiting_input_count || 0 }}</span>
+        </div>
+        <div class="codeg-session-list">
+          <div v-for="s in waitingSessions" :key="s.connection_id" class="session-row request">
+            <span class="session-state waiting">{{ waitingLabel(s) }}</span>
+            <div class="session-main">
+              <div class="session-name" :title="sessionTitle(s)">{{ sessionLabel(s) }}</div>
+              <div v-if="s.latest_reply" class="session-preview" :title="s.latest_reply">{{ s.latest_reply }}</div>
+            </div>
+            <span class="session-meta">{{ statusLabel(s) }}</span>
+          </div>
+          <div v-if="!waitingSessions.length" class="empty">暂无等待输入的会话</div>
+        </div>
+      </div>
     </template>
-  </footer>
+  </section>
 </template>
 
 <script setup>
-import { ref, watch, onMounted, onBeforeUnmount, computed } from 'vue'
+import { ref, watch, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useTauri } from '../composables/useTauri'
 
 const { invoke } = useTauri()
@@ -47,10 +91,42 @@ const status = ref({ connected: false, error: null, sessions: [], system: {} })
 const loading = ref(false)
 let timer = null
 
+const activeSessions = computed(() => (status.value.sessions || []).filter(s => ['prompting', 'connecting'].includes(s.status)))
+const waitingSessions = computed(() => (status.value.sessions || []).filter(s => s.waiting_for))
+
 function fmtNum(v) {
   const n = Number(v)
   if (!Number.isFinite(n)) return '0'
   return n >= 10 ? Math.round(n).toString() : n.toFixed(1)
+}
+
+function fmtBytes(gb, unit) {
+  const n = Number(gb)
+  if (!Number.isFinite(n)) return `0 ${unit || 'GB'}`
+  if (unit) return n.toFixed(1) + ' ' + unit
+  // 以 GB 输入，按数值规模自适应 KB/MB/GB
+  const mb = n * 1024
+  if (mb < 1) return Math.round(n * 1024 * 1024) + ' KB'
+  if (mb < 1024) return (mb >= 10 ? Math.round(mb) : mb.toFixed(1)) + ' MB'
+  return n.toFixed(1) + ' GB'
+}
+
+function sessionTitle(s) {
+  if (s.session_title || s.title) return s.session_title || s.title
+  return s.session_name || s.latest_reply || s.agent_type || '会话'
+}
+
+function sessionLabel(s) {
+  return sessionTitle(s)
+}
+
+function statusLabel(s) {
+  return s.status || 'unknown'
+}
+
+function waitingLabel(s) {
+  const map = { question: '等待问题输入', permission: '等待权限确认', plan_approval: '等待计划确认' }
+  return map[s.waiting_for] || '等待输入'
 }
 
 async function refresh() {
@@ -86,46 +162,96 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
-.codeg-bar {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  height: var(--codeg-bar-height, 44px);
-  min-height: var(--codeg-bar-height, 44px);
-  padding: 5px 20px;
+.codeg-dock {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 12px;
+  min-height: var(--codeg-bar-height, 210px);
+  padding: 12px 20px;
   border-top: 1px solid var(--border);
   background: var(--panel);
-  overflow-x: auto;
-  white-space: nowrap;
   flex-shrink: 0;
-  font-size: 12px;
-  color: var(--muted);
+  overflow: hidden;
 }
-.codeg-item { flex-shrink: 0; display: inline-flex; align-items: center; font-size: 12px; }
-.codeg-status { font-weight: 600; color: var(--text); }
-.codeg-running { color: var(--green); }
-.codeg-stopped { color: var(--muted); }
-.codeg-error { color: #ff6b6b; }
-.codeg-session { color: var(--text); max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
-.codeg-err { color: #ff6b6b; max-width: 46vw; overflow: hidden; text-overflow: ellipsis; }
-.warn { color: #ffb454; }
-.dot {
-  width: 7px; height: 7px; border-radius: 50%;
-  background: var(--green); box-shadow: 0 0 6px var(--green);
-  margin-right: 6px;
+.codeg-error-banner {
+  grid-column: 1 / -1;
+  display: flex; align-items: center; gap: 10px;
+  color: #ff6b6b; font-size: 13px;
 }
-.codeg-bar.error .dot { background: #ff6b6b; box-shadow: none; }
-.codeg-refresh {
-  margin-left: auto;
-  flex-shrink: 0;
-  background: var(--border);
+.codeg-err-text { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.codeg-col {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  min-width: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+.codeg-card-head {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 12px; margin-bottom: 8px;
+}
+.codeg-card-head strong { color: var(--text); font-weight: 600; }
+.badge {
+  font-size: 11px; color: var(--muted);
+  background: var(--border); border-radius: 10px; padding: 2px 8px;
+}
+.codeg-stat-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px;
+  overflow: hidden;
+}
+.stat-item { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.stat-item { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.stat-label { font-size: 10px; color: var(--muted); }
+.stat-value { font-size: 12px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.codeg-session-list {
+  overflow-y: auto; min-height: 0;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.session-row {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; padding: 5px 8px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+  min-width: 0;
+}
+.session-state {
+  flex-shrink: 0; font-size: 10px; padding: 2px 6px; border-radius: 4px;
+}
+.session-state.running { color: var(--green); background: rgba(53, 208, 165, .12); }
+.session-state.waiting { color: #ffb454; background: rgba(255, 180, 84, .12); }
+.session-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.session-name {
   color: var(--text);
-  border: 1px solid transparent;
-  border-radius: 6px;
-  padding: 4px 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 12px;
-  cursor: pointer;
+}
+.session-preview {
+  color: var(--muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-meta { color: var(--muted); font-size: 11px; flex-shrink: 0; }
+.empty { color: var(--muted); font-size: 12px; padding: 8px 0; }
+.codeg-refresh {
+  background: var(--border); color: var(--text);
+  border: 1px solid transparent; border-radius: 6px;
+  padding: 4px 10px; font-size: 12px; cursor: pointer;
 }
 .codeg-refresh:hover { filter: brightness(1.2); }
-.codeg-loading { margin-left: auto; color: var(--muted); }
+.dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #ff6b6b; flex-shrink: 0;
+}
 </style>

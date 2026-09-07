@@ -22,6 +22,7 @@ tokio-stream = "0.1"
 bytes = "1"
 chrono = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
+windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
 
 [profile.release]
 strip = true
