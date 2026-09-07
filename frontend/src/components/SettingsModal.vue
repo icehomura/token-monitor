@@ -93,8 +93,9 @@
               <BaseToggle v-model="codegEnabled" labelOn="已开启" labelOff="已关闭" />
             </div>
             <div class="codeg-field codeg-toggle">
-              <span class="codeg-label">自动恢复无输出会话</span>
+              <span class="codeg-label">高级自动恢复</span>
               <BaseToggle v-model="codegAutoRecovery" labelOn="已开启" labelOff="已关闭" />
+              <small class="codeg-advanced-hint">会话超过阈值无输出，或进入错误状态时自动停止并重试</small>
             </div>
             <div class="codeg-field codeg-timeout">
               <span class="codeg-label">不活跃阈值（秒）</span>
@@ -534,6 +535,12 @@ async function savePort() {
   flex-shrink: 0; border-radius: 6px; font-size: 12px;
 }
 .codeg-toggle { justify-content: center; }
+.codeg-advanced-hint {
+  font-size: 10px;
+  color: var(--muted);
+  max-width: 150px;
+  line-height: 1.35;
+}
 .codeg-timeout .input-wrap { width: 120px; }
 .codeg-actions { justify-content: flex-end; }
 

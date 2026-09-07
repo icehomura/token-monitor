@@ -1,4 +1,5 @@
 <template>
+  <div class="app-shell" :style="{ '--codeg-bar-height': codegBarVisible ? '44px' : '0px' }">
   <TitleBar
     :concurrency="stats.concurrency"
     @open-settings="showSettings = true"
@@ -35,6 +36,7 @@
     @close="showCloseDialog = false"
     @choice="onCloseChoice"
   />
+  </div>
 </template>
 
 <script setup>
@@ -51,7 +53,7 @@ import { useTheme, themeColors } from './composables/useTheme'
 import { getConvertUnits, setConvertUnits } from './utils/format'
 import { useTauri } from './composables/useTauri'
 
-const { listen, invoke } = useTauri()
+const { listen, invoke, getCurrentWindow } = useTauri()
 const { stats, refresh } = useStats()
 const { themeName, setTheme } = useTheme()
 
@@ -60,6 +62,34 @@ const showCloseDialog = ref(false)
 const convertUnits = ref(getConvertUnits())
 const toolbarRef = ref(null)
 const codegBarVisible = ref(false)
+const BASE_WINDOW_HEIGHT = 640
+let baseWindowHeight = BASE_WINDOW_HEIGHT
+
+async function rememberWindowHeight() {
+  const win = getCurrentWindow()
+  if (!win) return
+  try {
+    const size = await win?.outerSize?.()
+    if (size?.height && size.height >= BASE_WINDOW_HEIGHT) {
+      baseWindowHeight = size.height
+    }
+  } catch {}
+}
+
+async function applyWindowHeight(showCodeg) {
+  const win = getCurrentWindow()
+  if (!win) return
+  try {
+    const width = (await win?.outerSize?.())?.width || 1100
+    const height = showCodeg ? baseWindowHeight + 44 : baseWindowHeight
+    await win?.setSize?.({ width, height })
+  } catch {}
+}
+
+async function updateCodegBar(visible) {
+  codegBarVisible.value = visible
+  applyWindowHeight(visible)
+}
 
 // 当前范围状态：可能是字符串（预设）或 { range, startMs, endMs }（自定义）
 const currentRangeState = ref(toolbarRef.value?.selectedRange ?? (localStorage.getItem('tm_range') || '10'))
@@ -102,13 +132,14 @@ onMounted(async () => {
   unlistenCodeg = await listen('codeg-settings-changed', async () => {
     try {
       const r = await invoke('get_codeg_settings')
-      codegBarVisible.value = !!(r.config?.enabled)
+      updateCodegBar(!!(r.config?.enabled))
     } catch {}
   })
   // 加载 CodeG 显示开关；未配置时保持隐藏
+  await rememberWindowHeight()
   try {
     const r = await invoke('get_codeg_settings')
-    codegBarVisible.value = !!(r.config?.enabled)
+    updateCodegBar(!!(r.config?.enabled))
   } catch {}
 })
 
@@ -143,7 +174,7 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-rows: auto 1fr;
   gap: 16px;
-  height: calc(100vh - 40px - 46px - 42px);
+  height: calc(100vh - 40px - 46px - var(--codeg-bar-height, 0px));
   overflow: hidden;
 }
 </style>

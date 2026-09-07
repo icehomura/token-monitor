@@ -12,6 +12,7 @@
       <span class="codeg-item">会话 {{ status.session_count || 0 }}</span>
       <span class="codeg-item codeg-running">运行 {{ status.running_count || 0 }}</span>
       <span class="codeg-item codeg-stopped">停止 {{ status.stopped_count || 0 }}</span>
+      <span v-if="status.error_count > 0" class="codeg-item codeg-error">错误 {{ status.error_count || 0 }}</span>
       <span class="codeg-item" :class="{ warn: status.waiting_input_count > 0 }">
         等待输入 {{ status.waiting_input_count || 0 }}
       </span>
@@ -89,8 +90,8 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 14px;
-  height: 42px;
-  min-height: 42px;
+  height: var(--codeg-bar-height, 44px);
+  min-height: var(--codeg-bar-height, 44px);
   padding: 5px 20px;
   border-top: 1px solid var(--border);
   background: var(--panel);
@@ -104,6 +105,7 @@ onBeforeUnmount(() => {
 .codeg-status { font-weight: 600; color: var(--text); }
 .codeg-running { color: var(--green); }
 .codeg-stopped { color: var(--muted); }
+.codeg-error { color: #ff6b6b; }
 .codeg-session { color: var(--text); max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
 .codeg-err { color: #ff6b6b; max-width: 46vw; overflow: hidden; text-overflow: ellipsis; }
 .warn { color: #ffb454; }

@@ -101,6 +101,7 @@ pub struct CodegStatus {
     pub session_count: u64,
     pub running_count: u64,
     pub stopped_count: u64,
+    pub error_count: u64,
     pub waiting_input_count: u64,
     pub active_session_name: Option<String>,
     pub sessions: Vec<CodegSessionSummary>,
@@ -255,7 +256,11 @@ fn is_running(status: &str) -> bool {
 }
 
 fn is_stopped(status: &str) -> bool {
-    matches!(status, "disconnected" | "error")
+    status == "disconnected"
+}
+
+fn is_error(status: &str) -> bool {
+    status == "error"
 }
 
 fn waiting_label(snap: &CodegSnapshot) -> Option<String> {
@@ -322,8 +327,15 @@ async fn fetch_session_summaries(
             }
         }
 
-        // 不活跃判定：仅对存活且正在运行的连接生效；等待用户输入不算无输出。
-        if recover && is_running(&summary.status) && summary.waiting_for.is_none() {
+        // 错误状态：每次轮询发现就自动重试（cancel 后 prompt）。
+        // 运行/连接中无输出：按不活跃阈值触发同样恢复。
+        if recover && summary.waiting_for.is_none() {
+            let error_reason = if is_error(&summary.status) {
+                Some(format!("CodeG 会话进入错误状态（{}）", summary.status))
+            } else {
+                None
+            };
+
             let active_now = snap
                 .usage
                 .as_ref()
@@ -332,7 +344,9 @@ async fn fetch_session_summaries(
                 > 0
                 || snap.live_message.is_some();
             let threshold = config().inactivity_timeout_secs.max(10);
-            let should_restart = {
+            let should_restart = if error_reason.is_some() {
+                true
+            } else if is_running(&summary.status) {
                 // 锁只在该同步块内使用，避免 std MutexGuard 跨 await。
                 let mut map = last_activity_map().lock().unwrap();
                 let now = Instant::now();
@@ -350,12 +364,17 @@ async fn fetch_session_summaries(
                     summary.last_activity_at = Some(chrono::Utc::now().timestamp_millis());
                     entry.1 * DEFAULT_POLL_SECS >= threshold
                 }
+            } else {
+                false
             };
+
             if should_restart {
-                let reason = format!(
-                    "活跃会话 {} 秒无输出，触发自动停止并重启",
-                    summary.idle_secs
-                );
+                let reason = error_reason.unwrap_or_else(|| {
+                    format!(
+                        "活跃会话 {} 秒无输出，触发自动停止并重启",
+                        summary.idle_secs
+                    )
+                });
                 match session_action("restart", &summary.connection_id, Some("继续")).await {
                     Ok(_) => {
                         last_activity_map()
@@ -396,6 +415,7 @@ pub async fn codeg_status() -> Result<CodegStatus, String> {
     let summaries = fetch_session_summaries(auto_recovery, &mut events).await?;
     let running = summaries.iter().filter(|s| is_running(&s.status)).count() as u64;
     let stopped = summaries.iter().filter(|s| is_stopped(&s.status)).count() as u64;
+    let error_count = summaries.iter().filter(|s| is_error(&s.status)).count() as u64;
     let waiting = summaries.iter().filter(|s| s.waiting_for.is_some()).count() as u64;
     let active_session_name = summaries
         .iter()
@@ -416,6 +436,7 @@ pub async fn codeg_status() -> Result<CodegStatus, String> {
         session_count: summaries.len() as u64,
         running_count: running,
         stopped_count: stopped,
+        error_count,
         waiting_input_count: waiting,
         active_session_name,
         sessions: summaries,
