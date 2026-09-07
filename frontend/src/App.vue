@@ -1,5 +1,5 @@
 <template>
-  <div class="app-shell" :style="{ '--codeg-bar-height': codegBarVisible ? '180px' : '0px' }">
+  <div class="app-shell" :style="{ '--codeg-bar-height': codegBarVisible ? '220px' : '0px' }">
   <TitleBar
     :concurrency="stats.concurrency"
     @open-settings="showSettings = true"

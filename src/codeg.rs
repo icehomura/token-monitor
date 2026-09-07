@@ -337,8 +337,30 @@ fn waiting_label(snap: &CodegSnapshot) -> Option<String> {
 /// 每连接最后观测到“活动”（usage 或 live turn）的时间。
 static LAST_ACTIVITY: OnceLock<Mutex<HashMap<String, (Instant, u64)>>> = OnceLock::new();
 
+/// 自动恢复扫描限频：最短间隔 60 秒（与请求频率保持一致再收敛为可配置）。
+const RECOVERY_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
 fn last_activity_map() -> &'static Mutex<HashMap<String, (Instant, u64)>> {
     LAST_ACTIVITY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 上次执行自动恢复的时间点。`None` 表示从未执行过。
+static LAST_RECOVERY_RUN: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+fn should_run_recovery() -> bool {
+    let mut guard = LAST_RECOVERY_RUN
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    let should = match *guard {
+        Some(last) => now.duration_since(last) >= RECOVERY_MIN_INTERVAL,
+        None => true,
+    };
+    if should {
+        *guard = Some(now);
+    }
+    should
 }
 
 #[derive(Deserialize, Clone, Default)]
@@ -392,15 +414,12 @@ async fn fetch_session_summaries(
     events: &mut Vec<String>,
 ) -> Result<Vec<CodegSessionSummary>, String> {
     let raw_conns = post_api("acp_list_connections", &serde_json::json!({})).await?;
-    // Debug: 打印原始连接列表 JSON，便于排查字段
-    if let Ok(pretty) = serde_json::to_string_pretty(&raw_conns) {
-        eprintln!("[codeg] connections list: {}", pretty);
-    }
     let conns: Vec<CodegConnection> =
         serde_json::from_value(raw_conns)
             .map_err(|e| format!("解析 CodeG 连接列表失败：{e}"))?;
 
     let title_map = fetch_conversation_titles().await;
+    let recovery_now = recover && should_run_recovery();
     let mut summaries = Vec::with_capacity(conns.len());
     for c in conns {
         // 1. 先获取 snapshot（拿到 external_id 用于匹配标题）
@@ -440,11 +459,14 @@ async fn fetch_session_summaries(
             .cloned()
             .unwrap_or_else(|| summary.agent_type.clone());
 
-        // 错误状态：每次轮询发现就自动重试（cancel 后 prompt）。
+        // 错误状态：每 60 秒检查一次，自动重试（先 cancel 后 prompt）。
         // 运行/连接中无输出：按不活跃阈值触发同样恢复。
-        if recover && summary.waiting_for.is_none() {
+        // 仅在 CodeG API 正常（2xx）且到了恢复检查窗口时才做。
+        if recovery_now && summary.waiting_for.is_none() {
             let error_reason = if is_error(&summary.status) {
                 Some(format!("CodeG 会话进入错误状态（{}）", summary.status))
+            } else if is_stopped(&summary.status) {
+                Some(format!("CodeG 会话已停止（{}），尝试重启", summary.status))
             } else {
                 None
             };
@@ -490,6 +512,7 @@ async fn fetch_session_summaries(
                 });
                 match session_action("restart", &summary.connection_id, Some("继续")).await {
                     Ok(_) => {
+                        eprintln!("[codeg] 重启成功：{} (reason={})", summary.connection_id, reason);
                         last_activity_map()
                             .lock()
                             .unwrap()
@@ -726,5 +749,27 @@ pub fn collect_system_stats() -> SystemStats {
         collect_resource_stats()
     } else {
         SystemStats::default()
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_classification_is_stable() {
+        assert!(is_running("prompting"));
+        assert!(is_running("connecting"));
+        assert!(!is_running("connected"));
+        assert!(is_stopped("disconnected"));
+        assert!(!is_stopped("error"));
+        assert!(is_error("error"));
+        assert!(!is_error("disconnected"));
+    }
+
+    #[test]
+    fn recovery_is_rate_limited_to_minute_interval() {
+        // 第一次应放行，紧接着应被限频拒绝。
+        assert!(should_run_recovery());
+        assert!(!should_run_recovery());
     }
 }

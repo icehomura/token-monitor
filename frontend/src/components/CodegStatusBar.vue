@@ -40,37 +40,52 @@
 
       <div class="codeg-col codeg-col-active">
         <div class="codeg-card-head">
-          <strong>活跃会话</strong>
+          <strong>运行中会话</strong>
           <span class="badge">运行 {{ status.running_count || 0 }}</span>
         </div>
         <div class="codeg-session-list">
           <div v-for="s in activeSessions" :key="s.connection_id" class="session-row">
-            <span class="session-state" :class="'session-state--' + statusClass(s)">{{ statusLabel(s) }}</span>
             <div class="session-main">
               <div class="session-name" :title="sessionTitle(s)">{{ sessionTitle(s) }}</div>
               <div v-if="s.latest_reply" class="session-preview" :title="s.latest_reply">{{ s.latest_reply }}</div>
             </div>
-            <span class="session-meta">{{ statusLabel(s) }}</span>
+            <span class="session-state" :class="'session-state--' + statusClass(s)">{{ statusLabel(s) }}</span>
           </div>
-          <div v-if="!activeSessions.length" class="empty">暂无活跃会话</div>
+          <div v-if="!activeSessions.length" class="empty">暂无运行中会话</div>
         </div>
       </div>
 
       <div class="codeg-col codeg-col-request">
         <div class="codeg-card-head">
-          <strong>请求 / 等待输入</strong>
+          <strong>等待输入</strong>
           <span class="badge">等待 {{ status.waiting_input_count || 0 }}</span>
         </div>
         <div class="codeg-session-list">
           <div v-for="s in waitingSessions" :key="s.connection_id" class="session-row">
-            <span class="session-state" :class="'session-state--' + statusClass(s)">{{ statusLabel(s) }}</span>
             <div class="session-main">
               <div class="session-name" :title="sessionTitle(s)">{{ sessionTitle(s) }}</div>
               <div v-if="s.latest_reply" class="session-preview" :title="s.latest_reply">{{ s.latest_reply }}</div>
             </div>
-            <span class="session-meta">{{ statusLabel(s) }}</span>
+            <span class="session-state" :class="'session-state--' + statusClass(s)">{{ statusLabel(s) }}</span>
           </div>
           <div v-if="!waitingSessions.length" class="empty">暂无等待输入的会话</div>
+        </div>
+      </div>
+
+      <div class="codeg-col codeg-col-error">
+        <div class="codeg-card-head">
+          <strong>错误 / 已停止</strong>
+          <span class="badge">错误 {{ status.error_count || 0 }} · 停止 {{ status.stopped_count || 0 }}</span>
+        </div>
+        <div class="codeg-session-list">
+          <div v-for="s in errorSessions" :key="s.connection_id" class="session-row">
+            <div class="session-main">
+              <div class="session-name" :title="sessionTitle(s)">{{ sessionTitle(s) }}</div>
+              <div v-if="s.latest_reply" class="session-preview" :title="s.latest_reply">{{ s.latest_reply }}</div>
+            </div>
+            <span class="session-state" :class="'session-state--' + statusClass(s)">{{ statusLabel(s) }}</span>
+          </div>
+          <div v-if="!errorSessions.length" class="empty">暂无错误或已停止会话</div>
         </div>
       </div>
     </template>
@@ -93,6 +108,7 @@ let timer = null
 
 const activeSessions = computed(() => (status.value.sessions || []).filter(s => ['prompting', 'connecting'].includes(s.status)))
 const waitingSessions = computed(() => (status.value.sessions || []).filter(s => s.waiting_for))
+const errorSessions = computed(() => (status.value.sessions || []).filter(s => ['disconnected', 'error'].includes(s.status) && !s.waiting_for))
 
 function fmtNum(v) {
   const n = Number(v)
@@ -100,15 +116,13 @@ function fmtNum(v) {
   return n >= 10 ? Math.round(n).toString() : n.toFixed(1)
 }
 
-function fmtBytes(gb, unit) {
+function fmtBytes(gb) {
   const n = Number(gb)
-  if (!Number.isFinite(n)) return `0 ${unit || 'GB'}`
-  if (unit) return n.toFixed(1) + ' ' + unit
-  // 以 GB 输入，按数值规模自适应 KB/MB/GB
+  if (!Number.isFinite(n)) return '0 GB'
   const mb = n * 1024
   if (mb < 1) return Math.round(n * 1024 * 1024) + ' KB'
   if (mb < 1024) return (mb >= 10 ? Math.round(mb) : mb.toFixed(1)) + ' MB'
-  return n.toFixed(1) + ' GB'
+  return (n >= 10 ? Math.round(n) : n.toFixed(1)) + ' GB'
 }
 
 function sessionTitle(s) {
@@ -116,42 +130,23 @@ function sessionTitle(s) {
   return s.session_name || s.latest_reply || s.agent_type || '会话'
 }
 
-function sessionLabel(s) {
-  return sessionTitle(s)
-}
-
 function statusMeta(s) {
   if (s.waiting_for) {
-    return { label: waitingLabel(s), cls: 'waiting' }
+    const map = { question: '等待问题输入', permission: '等待权限确认', plan_approval: '等待计划确认' }
+    return { label: map[s.waiting_for] || '等待输入', cls: 'waiting' }
   }
   switch (s.status) {
-    case 'connecting':
-      return { label: '连接中', cls: 'connecting' }
-    case 'prompting':
-      return { label: '运行中', cls: 'running' }
-    case 'connected':
-      return { label: '空闲', cls: 'idle' }
-    case 'disconnected':
-      return { label: '已停止', cls: 'stopped' }
-    case 'error':
-      return { label: '错误', cls: 'error' }
-    default:
-      return { label: s.status || '未知', cls: 'unknown' }
+    case 'connecting': return { label: '连接中', cls: 'connecting' }
+    case 'prompting': return { label: '运行中', cls: 'running' }
+    case 'connected': return { label: '空闲', cls: 'idle' }
+    case 'disconnected': return { label: '已停止', cls: 'stopped' }
+    case 'error': return { label: '错误', cls: 'error' }
+    default: return { label: s.status || '未知', cls: 'unknown' }
   }
 }
 
-function statusLabel(s) {
-  return statusMeta(s).label
-}
-
-function statusClass(s) {
-  return statusMeta(s).cls
-}
-
-function waitingLabel(s) {
-  const map = { question: '等待问题输入', permission: '等待权限确认', plan_approval: '等待计划确认' }
-  return map[s.waiting_for] || '等待输入'
-}
+function statusLabel(s) { return statusMeta(s).label }
+function statusClass(s) { return statusMeta(s).cls }
 
 async function refresh() {
   if (loading.value) return
@@ -188,10 +183,10 @@ onBeforeUnmount(() => {
 <style scoped>
 .codeg-dock {
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-columns: 280px 1fr 1fr 1fr;
   gap: 12px;
   min-height: var(--codeg-bar-height, 210px);
-  padding: 12px 20px;
+  padding: 12px 16px;
   border-top: 1px solid var(--border);
   background: var(--panel);
   flex-shrink: 0;
@@ -226,7 +221,6 @@ onBeforeUnmount(() => {
   display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px;
   overflow: hidden;
 }
-.stat-item { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .stat-item { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .stat-label { font-size: 10px; color: var(--muted); }
 .stat-value { font-size: 12px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -235,21 +229,11 @@ onBeforeUnmount(() => {
   display: flex; flex-direction: column; gap: 6px;
 }
 .session-row {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
   font-size: 12px; padding: 5px 8px;
   background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
   min-width: 0;
 }
-.session-state {
-  flex-shrink: 0; font-size: 10px; padding: 2px 6px; border-radius: 4px;
-}
-.session-state--running { color: var(--green); background: rgba(53, 208, 165, .12); }
-.session-state--connecting { color: #58a6ff; background: rgba(88, 166, 255, .12); }
-.session-state--idle { color: #8b97b0; background: rgba(139, 151, 176, .12); }
-.session-state--waiting { color: #ffb454; background: rgba(255, 180, 84, .12); }
-.session-state--stopped { color: var(--muted); background: var(--border); }
-.session-state--error { color: #ff6b6b; background: rgba(255, 107, 107, .12); }
-.session-state--unknown { color: var(--muted); background: var(--border); }
 .session-main {
   display: flex;
   flex-direction: column;
@@ -271,9 +255,20 @@ onBeforeUnmount(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.session-meta { color: var(--muted); font-size: 11px; flex-shrink: 0; }
+.session-state {
+  flex-shrink: 0; font-size: 10px; padding: 2px 6px; border-radius: 4px;
+  white-space: nowrap;
+}
+.session-state--running { color: var(--green); background: rgba(53, 208, 165, .12); }
+.session-state--connecting { color: #58a6ff; background: rgba(88, 166, 255, .12); }
+.session-state--idle { color: #8b97b0; background: rgba(139, 151, 176, .12); }
+.session-state--waiting { color: #ffb454; background: rgba(255, 180, 84, .12); }
+.session-state--stopped { color: var(--muted); background: var(--border); }
+.session-state--error { color: #ff6b6b; background: rgba(255, 107, 107, .12); }
+.session-state--unknown { color: var(--muted); background: var(--border); }
 .empty { color: var(--muted); font-size: 12px; padding: 8px 0; }
 .codeg-refresh {
+  margin-left: auto;
   background: var(--border); color: var(--text);
   border: 1px solid transparent; border-radius: 6px;
   padding: 4px 10px; font-size: 12px; cursor: pointer;
