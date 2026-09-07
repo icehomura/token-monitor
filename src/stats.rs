@@ -101,7 +101,7 @@ pub fn init_db() {
                 .query_row("SELECT COUNT(*) FROM requests", [], |r| r.get(0))
                 .unwrap_or(0);
             println!("[stats] SQLite 已就绪：{}，{} 条记录", path.display(), count);
-            *DB.lock().unwrap() = Some(conn);
+            *DB.lock().unwrap_or_else(|e| e.into_inner()) = Some(conn);
         }
         Err(e) => {
             eprintln!("[stats] SQLite 打开失败：{e}，统计功能不可用");
@@ -166,7 +166,7 @@ pub fn try_acquire(max: u64) -> Option<i64> {
         }
         // 先检查 DB 是否就绪，避免 counter +1 后 DB 不可用导致泄漏
         {
-            let guard = DB.lock().unwrap();
+            let guard = DB.lock().unwrap_or_else(|e| e.into_inner());
             if guard.is_none() {
                 // DB 未就绪，不增加计数器，直接返回 0（调用方负责后续减一）
                 return Some(0);
@@ -177,7 +177,7 @@ pub fn try_acquire(max: u64) -> Option<i64> {
             .is_ok()
         {
             let now = chrono::Local::now().timestamp_millis();
-            let guard = DB.lock().unwrap();
+            let guard = DB.lock().unwrap_or_else(|e| e.into_inner());
             let conn = match guard.as_ref() {
                 // 上面已检查过，理论上不会再 None，防御性处理
                 None => {
@@ -206,7 +206,7 @@ pub fn try_acquire(max: u64) -> Option<i64> {
 pub fn update_last_tokens(rowid: i64, tokens: TokenCounts) {
     if rowid > 0 {
         ACTIVE.fetch_sub(1, Ordering::Relaxed);
-        if let Some(conn) = DB.lock().unwrap().as_ref() {
+        if let Some(conn) = DB.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             let now = chrono::Local::now().timestamp_millis();
             let _ = conn.execute(
                 "UPDATE requests SET token_at_ms = ?1, input_tokens = ?2, output_tokens = ?3, cached_tokens = ?4, in_flight = 0
@@ -221,7 +221,7 @@ pub fn update_last_tokens(rowid: i64, tokens: TokenCounts) {
 /// 用于流式任务内部：ACTIVE 的释放由 SlotGuard 统一管理。
 pub fn update_tokens_db_only(rowid: i64, tokens: TokenCounts) {
     if rowid > 0 {
-        if let Some(conn) = DB.lock().unwrap().as_ref() {
+        if let Some(conn) = DB.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             let now = chrono::Local::now().timestamp_millis();
             let _ = conn.execute(
                 "UPDATE requests SET token_at_ms = ?1, input_tokens = ?2, output_tokens = ?3, cached_tokens = ?4
@@ -278,7 +278,7 @@ pub fn buckets(window_minutes: u32) -> Vec<MinuteBucket> {
     let current_floor = floor_to_minute(now);
     let mut out = Vec::with_capacity(window_minutes as usize);
 
-    let guard = DB.lock().unwrap();
+    let guard = DB.lock().unwrap_or_else(|e| e.into_inner());
     let conn = match guard.as_ref() {
         Some(c) => c,
         None => return out,
@@ -365,7 +365,7 @@ pub fn buckets(window_minutes: u32) -> Vec<MinuteBucket> {
 /// 自定义时间范围查询：按绝对时间戳聚合，每分钟一个桶
 pub fn buckets_range(start_ms: i64, end_ms: i64) -> Vec<MinuteBucket> {
     let mut out = Vec::new();
-    let guard = DB.lock().unwrap();
+    let guard = DB.lock().unwrap_or_else(|e| e.into_inner());
     let conn = match guard.as_ref() {
         Some(c) => c,
         None => return out,

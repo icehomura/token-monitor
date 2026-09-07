@@ -506,7 +506,118 @@ fn config_candidates() -> Vec<std::path::PathBuf> {
     .collect()
 }
 
+/// 将消息追加写入 exe 旁的 crash.log
+fn write_crash_log(msg: &str) {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let path = dir.join("crash.log");
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = f.write_all(msg.as_bytes());
+            }
+        }
+    }
+    eprintln!("{msg}");
+}
+
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("unnamed");
+        let payload = info.payload();
+        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "(no payload)".to_string()
+        };
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "(unknown)".to_string());
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let log_msg = format!(
+            "\n=== PANIC [{thread_name}] {timestamp} ===\nMessage: {msg}\nLocation: {location}\nBacktrace:\n{backtrace}\n"
+        );
+        write_crash_log(&log_msg);
+        default_hook(info);
+    }));
+}
+
+/// 安装 Windows 结构化异常过滤器：捕获 ACCESS_VIOLATION / STACK_OVERFLOW 等
+/// 非 panic 的崩溃，写入 crash.log 后让进程正常退出。
+#[cfg(target_os = "windows")]
+fn install_seh_handler() {
+    // 使用原始 FFI 而非 windows-sys 模块路径，避免版本差异
+    #[repr(C)]
+    #[allow(dead_code, non_camel_case_types)]
+    #[derive(Copy, Clone)]
+    struct EXCEPTION_RECORD {
+        ExceptionCode: u32,
+        ExceptionFlags: u32,
+        ExceptionRecord: *mut EXCEPTION_RECORD,
+        ExceptionAddress: *mut core::ffi::c_void,
+        NumberParameters: u32,
+        ExceptionInformation: [usize; 15],
+    }
+    #[repr(C)]
+    #[allow(non_camel_case_types)]
+    #[derive(Copy, Clone)]
+    struct EXCEPTION_POINTERS {
+        ExceptionRecord: *mut EXCEPTION_RECORD,
+        ContextRecord: *mut core::ffi::c_void,
+    }
+    #[allow(non_camel_case_types)]
+    type LONG_PTR = isize;
+
+    unsafe extern "system" fn filter(exception_info: *mut EXCEPTION_POINTERS) -> LONG_PTR {
+        let code = if !exception_info.is_null() {
+            let record = (*exception_info).ExceptionRecord;
+            if !record.is_null() { (*record).ExceptionCode } else { 0 }
+        } else {
+            0
+        };
+        let name = match code {
+            0xC0000005 => "ACCESS_VIOLATION",
+            0xC00000FD => "STACK_OVERFLOW",
+            0xC0000374 => "HEAP_CORRUPTION",
+            0x80000003 => "BREAKPOINT",
+            0x80000004 => "SINGLE_STEP",
+            0xC000013A => "CTRL_C_EXIT",
+            _ => "UNKNOWN",
+        };
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let log_msg = format!(
+            "\n=== SEH CRASH [{}] ===\nExceptionCode: 0x{:08X} ({})\nThe application encountered a fatal error and must close.\n",
+            timestamp, code, name
+        );
+        write_crash_log(&log_msg);
+        0 // EXCEPTION_CONTINUE_SEARCH
+    }
+
+    unsafe {
+        extern "system" {
+            fn SetUnhandledExceptionFilter(
+                lpTopLevelExceptionFilter: Option<unsafe extern "system" fn(*mut EXCEPTION_POINTERS) -> LONG_PTR>,
+            );
+        }
+        SetUnhandledExceptionFilter(Some(filter));
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn install_seh_handler() {}
+
 fn main() {
+    install_panic_hook();
+    install_seh_handler();
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,

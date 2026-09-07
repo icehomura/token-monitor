@@ -50,13 +50,13 @@ const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 pub fn init(handle: tauri::AppHandle, cfg: ProxyConfig) {
     let _ = APP_HANDLE.set(handle);
-    *CONFIG.write().unwrap() = Some(cfg);
+    *CONFIG.write().unwrap_or_else(|e| e.into_inner()) = Some(cfg);
 }
 
 pub fn cfg() -> ProxyConfig {
     CONFIG
         .read()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .clone()
         .expect("proxy config not initialized")
 }
@@ -68,7 +68,7 @@ pub fn update_runtime(
     upstream_url: Option<String>,
     max_concurrency: Option<usize>,
 ) {
-    let mut c = CONFIG.write().unwrap();
+    let mut c = CONFIG.write().unwrap_or_else(|e| e.into_inner());
     if let Some(c) = c.as_mut() {
         if let Some(k) = api_key {
             c.api_key = k;
@@ -100,7 +100,7 @@ pub fn app_handle() -> Option<&'static tauri::AppHandle> {
 pub async fn restart_server(new_port: u16) -> Result<(), String> {
     // 1. 停止旧实例，等待优雅退出释放端口
     //    先把锁作用域结束，避免 MutexGuard 跨 await 导致 future 非 Send
-    let existing = SERVER.lock().unwrap().take();
+    let existing = SERVER.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(handle) = existing {
         let _ = handle.shutdown.send(true);
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -115,7 +115,7 @@ pub async fn restart_server(new_port: u16) -> Result<(), String> {
 
     // 3. 更新配置并启动
     {
-        let mut c = CONFIG.write().unwrap();
+        let mut c = CONFIG.write().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = c.as_mut() {
             c.port = new_port;
         }
@@ -129,7 +129,7 @@ pub async fn restart_server(new_port: u16) -> Result<(), String> {
             .await
             .ok();
     });
-    *SERVER.lock().unwrap() = Some(ServerHandle { shutdown: tx, _join: join });
+    *SERVER.lock().unwrap_or_else(|e| e.into_inner()) = Some(ServerHandle { shutdown: tx, _join: join });
     println!("proxy server listening on http://{addr}/v1 (chat/completions | responses | messages)");
     Ok(())
 }
