@@ -45,7 +45,7 @@
         </div>
         <div class="codeg-session-list">
           <div v-for="s in activeSessions" :key="s.connection_id" class="session-row">
-            <span class="session-state running">运行中</span>
+            <span class="session-state" :class="'session-state--' + statusClass(s)">{{ statusLabel(s) }}</span>
             <div class="session-main">
               <div class="session-name" :title="sessionTitle(s)">{{ sessionTitle(s) }}</div>
               <div v-if="s.latest_reply" class="session-preview" :title="s.latest_reply">{{ s.latest_reply }}</div>
@@ -62,10 +62,10 @@
           <span class="badge">等待 {{ status.waiting_input_count || 0 }}</span>
         </div>
         <div class="codeg-session-list">
-          <div v-for="s in waitingSessions" :key="s.connection_id" class="session-row request">
-            <span class="session-state waiting">{{ waitingLabel(s) }}</span>
+          <div v-for="s in waitingSessions" :key="s.connection_id" class="session-row">
+            <span class="session-state" :class="'session-state--' + statusClass(s)">{{ statusLabel(s) }}</span>
             <div class="session-main">
-              <div class="session-name" :title="sessionTitle(s)">{{ sessionLabel(s) }}</div>
+              <div class="session-name" :title="sessionTitle(s)">{{ sessionTitle(s) }}</div>
               <div v-if="s.latest_reply" class="session-preview" :title="s.latest_reply">{{ s.latest_reply }}</div>
             </div>
             <span class="session-meta">{{ statusLabel(s) }}</span>
@@ -120,8 +120,32 @@ function sessionLabel(s) {
   return sessionTitle(s)
 }
 
+function statusMeta(s) {
+  if (s.waiting_for) {
+    return { label: waitingLabel(s), cls: 'waiting' }
+  }
+  switch (s.status) {
+    case 'connecting':
+      return { label: '连接中', cls: 'connecting' }
+    case 'prompting':
+      return { label: '运行中', cls: 'running' }
+    case 'connected':
+      return { label: '空闲', cls: 'idle' }
+    case 'disconnected':
+      return { label: '已停止', cls: 'stopped' }
+    case 'error':
+      return { label: '错误', cls: 'error' }
+    default:
+      return { label: s.status || '未知', cls: 'unknown' }
+  }
+}
+
 function statusLabel(s) {
-  return s.status || 'unknown'
+  return statusMeta(s).label
+}
+
+function statusClass(s) {
+  return statusMeta(s).cls
 }
 
 function waitingLabel(s) {
@@ -219,8 +243,13 @@ onBeforeUnmount(() => {
 .session-state {
   flex-shrink: 0; font-size: 10px; padding: 2px 6px; border-radius: 4px;
 }
-.session-state.running { color: var(--green); background: rgba(53, 208, 165, .12); }
-.session-state.waiting { color: #ffb454; background: rgba(255, 180, 84, .12); }
+.session-state--running { color: var(--green); background: rgba(53, 208, 165, .12); }
+.session-state--connecting { color: #58a6ff; background: rgba(88, 166, 255, .12); }
+.session-state--idle { color: #8b97b0; background: rgba(139, 151, 176, .12); }
+.session-state--waiting { color: #ffb454; background: rgba(255, 180, 84, .12); }
+.session-state--stopped { color: var(--muted); background: var(--border); }
+.session-state--error { color: #ff6b6b; background: rgba(255, 107, 107, .12); }
+.session-state--unknown { color: var(--muted); background: var(--border); }
 .session-main {
   display: flex;
   flex-direction: column;
