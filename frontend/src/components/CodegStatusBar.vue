@@ -262,7 +262,7 @@ onBeforeUnmount(() => {
 <style scoped>
 .codeg-dock {
   display: grid;
-  grid-template-columns: minmax(260px, 1.35fr) 1fr 1fr 1fr;
+  grid-template-columns: minmax(260px, 1.12fr) 1fr 1fr 1fr;
   gap: 12px;
   min-height: var(--codeg-bar-height, 240px);
   padding: 12px 16px;
@@ -300,9 +300,9 @@ onBeforeUnmount(() => {
 }
 .codeg-stat-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 8px;
-  overflow: hidden;
+  overflow: auto;
   flex: 1;
   align-content: start;
 }
