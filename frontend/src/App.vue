@@ -20,6 +20,7 @@
       :convertUnits="convertUnits"
     />
   </section>
+  <CodegStatusBar :show="codegBarVisible" />
   <SettingsModal
     :visible="showSettings"
     :themeName="themeName"
@@ -42,6 +43,7 @@ import TitleBar from './components/TitleBar.vue'
 import Toolbar from './components/Toolbar.vue'
 import StatsCards from './components/StatsCards.vue'
 import RpmChart from './components/RpmChart.vue'
+import CodegStatusBar from './components/CodegStatusBar.vue'
 import SettingsModal from './components/SettingsModal.vue'
 import CloseDialog from './components/CloseDialog.vue'
 import { useStats } from './composables/useStats'
@@ -49,7 +51,7 @@ import { useTheme, themeColors } from './composables/useTheme'
 import { getConvertUnits, setConvertUnits } from './utils/format'
 import { useTauri } from './composables/useTauri'
 
-const { listen } = useTauri()
+const { listen, invoke } = useTauri()
 const { stats, refresh } = useStats()
 const { themeName, setTheme } = useTheme()
 
@@ -57,6 +59,7 @@ const showSettings = ref(false)
 const showCloseDialog = ref(false)
 const convertUnits = ref(getConvertUnits())
 const toolbarRef = ref(null)
+const codegBarVisible = ref(false)
 
 // 当前范围状态：可能是字符串（预设）或 { range, startMs, endMs }（自定义）
 const currentRangeState = ref(toolbarRef.value?.selectedRange ?? (localStorage.getItem('tm_range') || '10'))
@@ -70,6 +73,7 @@ function onRangeChange(range) {
 
 let unlisten = null
 let unlistenClose = null
+let unlistenCodeg = null
 let refreshTimer = null
 let pollTimer = null
 
@@ -95,11 +99,23 @@ onMounted(async () => {
   pollTimer = setInterval(() => refresh(currentRange()), 5000)
   unlisten = await listen('stats-updated', debouncedRefresh)
   unlistenClose = await listen('close-requested', () => { showCloseDialog.value = true })
+  unlistenCodeg = await listen('codeg-settings-changed', async () => {
+    try {
+      const r = await invoke('get_codeg_settings')
+      codegBarVisible.value = !!(r.config?.enabled)
+    } catch {}
+  })
+  // 加载 CodeG 显示开关；未配置时保持隐藏
+  try {
+    const r = await invoke('get_codeg_settings')
+    codegBarVisible.value = !!(r.config?.enabled)
+  } catch {}
 })
 
 onBeforeUnmount(() => {
   unlisten?.()
   unlistenClose?.()
+  unlistenCodeg?.()
   clearInterval(pollTimer)
   clearTimeout(refreshTimer)
 })
@@ -127,7 +143,7 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-rows: auto 1fr;
   gap: 16px;
-  height: calc(100vh - 40px - 46px);
+  height: calc(100vh - 40px - 46px - 42px);
   overflow: hidden;
 }
 </style>

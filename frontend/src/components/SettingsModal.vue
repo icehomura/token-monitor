@@ -72,6 +72,43 @@
           </SettingsCard>
         </div>
 
+        <!-- CodeG 服务器 -->
+        <SettingsCard title="CodeG 服务器" description="连接 Codeg server，在 Token Monitor 底部显示并监控活跃会话" stretch>
+          <div class="codeg-grid">
+            <div class="codeg-field">
+              <span class="codeg-label">服务器地址</span>
+              <BaseInput v-model="codegUrl" placeholder="http://127.0.0.1:3080" />
+            </div>
+            <div class="codeg-field">
+              <span class="codeg-label">服务器 Token</span>
+              <div class="codeg-token-row">
+                <BaseInput v-model="codegToken" :type="showToken ? 'text' : 'password'" placeholder="Codeg server CODEG_TOKEN" />
+                <IconButton class="codeg-token-eye" title="显示/隐藏 Token" @click="showToken = !showToken">
+                  <span>{{ showToken ? '隐藏' : '显示' }}</span>
+                </IconButton>
+              </div>
+            </div>
+            <div class="codeg-field codeg-toggle">
+              <span class="codeg-label">底部 CodeG 行</span>
+              <BaseToggle v-model="codegEnabled" labelOn="已开启" labelOff="已关闭" />
+            </div>
+            <div class="codeg-field codeg-toggle">
+              <span class="codeg-label">自动恢复无输出会话</span>
+              <BaseToggle v-model="codegAutoRecovery" labelOn="已开启" labelOff="已关闭" />
+            </div>
+            <div class="codeg-field codeg-timeout">
+              <span class="codeg-label">不活跃阈值（秒）</span>
+              <BaseInput v-model.number="codegTimeout" type="number" :min="10" spinner />
+            </div>
+            <div class="codeg-field codeg-actions">
+              <BaseButton variant="primary" @click="saveCodeg">保存 CodeG 配置</BaseButton>
+            </div>
+          </div>
+          <template #hint>
+            <small :class="['ff-hint', codegMsgType]">{{ codegMsg }}</small>
+          </template>
+        </SettingsCard>
+
         <!-- 两列：单位转换 + 并发数 -->
         <div class="grid-2">
           <SettingsCard title="词元数量单位转换" description="开启后超过 1000 显示为 K / M / B，保留 1 位小数" modifier="unit">
@@ -218,6 +255,16 @@ const autostart = ref(false)
 const autostartMsg = ref('')
 const autostartMsgType = ref('')
 
+// ──────── CodeG 服务器状态 ────────
+const codegEnabled = ref(false)
+const codegUrl = ref('http://127.0.0.1:3080')
+const codegToken = ref('')
+const codegAutoRecovery = ref(true)
+const codegTimeout = ref(120)
+const showToken = ref(false)
+const codegMsg = ref('')
+const codegMsgType = ref('')
+
 // ──────── 打开时加载数据 ────────
 // 防止打开 modal 时 watcher 触发多余的保存
 const _loadingSettings = ref(true)
@@ -245,6 +292,16 @@ watch(() => props.visible, async (v) => {
   } catch {}
   try {
     autostart.value = await invoke('get_autostart')
+  } catch {}
+  // 加载 CodeG 配置
+  try {
+    const c = await invoke('get_codeg_settings')
+    const cfg = c.config || {}
+    codegEnabled.value = !!cfg.enabled
+    codegUrl.value = cfg.server_url || 'http://127.0.0.1:3080'
+    codegToken.value = cfg.token || ''
+    codegAutoRecovery.value = cfg.auto_recovery !== false
+    codegTimeout.value = cfg.inactivity_timeout_secs || 120
   } catch {}
   _loadingSettings.value = false
 })
@@ -329,6 +386,25 @@ function onProfileSave(profile) {
   }).catch(e => {
     profileMsg.value = String(e); profileMsgType.value = 'err'
   })
+}
+
+// ──────── CodeG ────────
+async function saveCodeg() {
+  codegMsg.value = '保存中…'; codegMsgType.value = ''
+  const cfg = {
+    enabled: codegEnabled.value,
+    server_url: codegUrl.value.trim(),
+    token: codegToken.value,
+    auto_recovery: codegAutoRecovery.value,
+    inactivity_timeout_secs: Math.max(10, Number(codegTimeout.value) || 120),
+  }
+  try {
+    const r = await invoke('set_codeg_settings', { config: cfg })
+    codegMsg.value = `✓ 已保存${r.config.enabled ? '，CodeG 行已开启' : '，CodeG 行已关闭'}`
+    codegMsgType.value = 'ok'
+  } catch (e) {
+    codegMsg.value = String(e); codegMsgType.value = 'err'
+  }
 }
 
 // ──────── 端口 ────────
@@ -436,6 +512,30 @@ async function savePort() {
 /* 端口行 */
 .port-row { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; }
 .port-row .input-wrap { flex: 0 0 150px; min-width: 0; }
+
+/* CodeG 服务器 */
+.codeg-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 10px 14px;
+  width: 100%;
+}
+.codeg-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+.codeg-label { font-size: 11px; color: var(--muted); }
+.codeg-token-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.codeg-token-row .input-wrap { flex: 1; min-width: 0; }
+.codeg-token-eye {
+  width: 34px !important; height: 34px !important;
+  flex-shrink: 0; border-radius: 6px; font-size: 12px;
+}
+.codeg-toggle { justify-content: center; }
+.codeg-timeout .input-wrap { width: 120px; }
+.codeg-actions { justify-content: flex-end; }
 
 /* 主题 */
 .theme-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }

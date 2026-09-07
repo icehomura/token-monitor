@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod codeg;
 mod proxy;
 mod stats;
 
@@ -176,6 +177,52 @@ fn set_model_config(api_key: String, model_override: String) -> Result<serde_jso
         let _ = handle.emit("server-info-changed", ());
     }
     Ok(serde_json::json!({"model_override": model_trimmed, "has_api_key": !key_trimmed.is_empty()}))
+}
+
+#[derive(serde::Serialize)]
+struct CodegSettingsResponse {
+    config: codeg::CodegConfig,
+}
+
+/// 获取 CodeG 服务器设置
+#[tauri::command]
+fn get_codeg_settings() -> CodegSettingsResponse {
+    let cfg = parse_saved_config(codeg::load_from_json);
+    CodegSettingsResponse { config: cfg }
+}
+
+/// 保存 CodeG 服务器设置并热更新运行时，不阻塞应用启动
+#[tauri::command]
+fn set_codeg_settings(config: codeg::CodegConfig) -> Result<CodegSettingsResponse, String> {
+    let path = config_path().ok_or("无法确定配置文件路径")?;
+    let mut v: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    codeg::save_to_json(&mut v, &config);
+    std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap())
+        .map_err(|e| format!("写入配置失败：{e}"))?;
+    let saved = codeg::update_config(config);
+    if let Some(handle) = proxy::app_handle() {
+        let _ = handle.emit("codeg-settings-changed", ());
+    }
+    Ok(CodegSettingsResponse { config: saved })
+}
+
+/// 获取 CodeG 实时状态：会话数量、运行/停止/等待输入、活跃名称、进程与资源占用
+#[tauri::command]
+async fn get_codeg_status() -> Result<codeg::CodegStatus, String> {
+    codeg::codeg_status().await
+}
+
+/// 预留会话操作：stop / restart / disconnect，可对接后续 UI
+#[tauri::command]
+async fn codeg_session_action(
+    action: String,
+    connection_id: String,
+    message: Option<String>,
+) -> Result<serde_json::Value, String> {
+    codeg::session_action(&action, &connection_id, message.as_deref()).await
 }
 
 #[derive(Serialize)]
@@ -428,7 +475,25 @@ fn read_api_key() -> String {
 }
 
 fn read_saved_config_str(key: &str) -> String {
-    let candidates: Vec<std::path::PathBuf> = [
+    parse_saved_config(|v| v.get(key).and_then(|m| m.as_str()).unwrap_or("").trim().to_string())
+}
+
+fn parse_saved_config<T>(f: impl FnOnce(&serde_json::Value) -> T) -> T
+where
+    T: Default,
+{
+    for candidate in config_candidates() {
+        if let Ok(text) = std::fs::read_to_string(&candidate) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                return f(&v);
+            }
+        }
+    }
+    T::default()
+}
+
+fn config_candidates() -> Vec<std::path::PathBuf> {
+    vec![
         std::env::current_exe().ok().map(|d| {
             d.parent()
                 .unwrap_or(std::path::Path::new("."))
@@ -438,17 +503,7 @@ fn read_saved_config_str(key: &str) -> String {
     ]
     .into_iter()
     .flatten()
-    .collect();
-    for candidate in candidates {
-        if let Ok(text) = std::fs::read_to_string(&candidate) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(m) = v.get(key).and_then(|m| m.as_str()) {
-                    return m.trim().to_string();
-                }
-            }
-        }
-    }
-    String::new()
+    .collect()
 }
 
 fn main() {
@@ -463,6 +518,9 @@ fn main() {
             let saved_max_conc: usize = read_saved_config_str("max_concurrency")
                 .parse()
                 .unwrap_or(20);
+            // CodeG 配置独立加载；未配置时保持默认，不阻塞应用启动
+            let codeg_config_v: serde_json::Value = parse_saved_config(serde_json::Value::clone);
+            codeg::load_from_json(&codeg_config_v);
             let mut cfg = proxy::ProxyConfig {
                 api_key: read_api_key(),
                 model_override: {
@@ -614,6 +672,10 @@ fn main() {
             get_stats,
             get_server_info,
             get_settings,
+            get_codeg_settings,
+            set_codeg_settings,
+            get_codeg_status,
+            codeg_session_action,
             set_port,
             set_model_config,
             set_upstream,
