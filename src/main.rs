@@ -146,30 +146,6 @@ pub(crate) fn app_data_override() -> Option<std::path::PathBuf> {
     None
 }
 
-pub(crate) fn config_path() -> Option<std::path::PathBuf> {
-    // macOS：配置固定读写包外目录（见 app_data_override）
-    if let Some(dir) = app_data_override() {
-        return Some(dir.join("token-monitor.json"));
-    }
-    [
-        std::env::current_exe().ok().map(|d| {
-            d.parent()
-                .unwrap_or(std::path::Path::new("."))
-                .join("token-monitor.json")
-        }),
-        std::env::current_dir().ok().map(|d| d.join("token-monitor.json")),
-    ]
-    .into_iter()
-    .flatten()
-    .find(|p| p.exists())
-    .or_else(|| {
-        // 不存在时默认写到 exe 旁边
-        std::env::current_exe()
-            .ok()
-            .and_then(|d| d.parent().map(|p| p.join("token-monitor.json")))
-    })
-}
-
 fn save_port(port: u16) -> Result<(), String> {
     let path = config_path().ok_or("无法确定配置文件路径")?;
     let mut v: serde_json::Value = std::fs::read_to_string(&path)
@@ -535,7 +511,30 @@ where
     T::default()
 }
 
-/// 配置文件查找顺序：包外数据目录（仅 macOS）→ exe 同目录 → 工作目录
+/// 配置文件读写目标。
+///
+/// 读和写必须指向同一个文件，否则会出现：
+/// - config_candidates() 在 exe 目录读到旧配置（port: 0）
+/// - save_port() 把数据写到数据目录的新文件
+/// - 下次启动又读到 exe 目录的旧文件 → 端口永远是 0
+///
+/// 规则：
+///   1. 找到第一个已存在的候选文件 → 读写都在这里
+///   2. 都不存在 → 写到数据目录（macOS）或 exe 目录（其他平台）
+pub(crate) fn config_path() -> Option<std::path::PathBuf> {
+    let candidates = config_candidates();
+    candidates.into_iter().next().or_else(|| {
+        app_data_override().map(|d| d.join("token-monitor.json"))
+            .or_else(|| {
+                std::env::current_exe().ok().and_then(|e| {
+                    e.parent().map(|p| p.join("token-monitor.json"))
+                })
+            })
+    })
+}
+
+/// 配置文件候选路径，读写顺序一致，避免读 A 写 B 的死锁。
+/// 首先检查数据目录（macOS/AppImage），再检查 exe 同目录、工作目录。
 fn config_candidates() -> Vec<std::path::PathBuf> {
     let mut out: Vec<std::path::PathBuf> = Vec::new();
     if let Some(dir) = app_data_override() {
