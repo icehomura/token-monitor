@@ -129,7 +129,7 @@ pub(crate) fn app_data_override() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let dir = home.join("Library/Application Support/com.hlw.token-monitor");
+    let dir = home.join("Library/Application Support/com.icehomura.token-monitor");
     let _ = std::fs::create_dir_all(&dir);
     Some(dir)
 }
