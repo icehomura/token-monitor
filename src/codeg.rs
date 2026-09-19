@@ -1,4 +1,4 @@
-//! CodeG server 连接：配置持久化、`POST /api/*` Bearer 调用、会话快照聚合，
+//! Codeg server 连接：配置持久化、`POST /api/*` Bearer 调用、会话快照聚合，
 //! 以及 Windows 下 Node/agent 进程与系统资源统计。
 //!
 //! Codeg server 的真实数据接口（来自 codeg 源码 `web/router.rs` / `handlers/acp.rs`）：
@@ -149,7 +149,7 @@ pub fn update_config(cfg: CodegConfig) -> CodegConfig {
     cfg
 }
 
-/// 从 token-monitor.json 读取并初始化 CodeG 配置；未配置时使用默认值，不阻塞启动。
+/// 从 token-monitor.json 读取并初始化 Codeg 配置；未配置时使用默认值，不阻塞启动。
 pub fn load_from_json(v: &serde_json::Value) -> CodegConfig {
     let mut cfg = CodegConfig::default();
     if let Some(o) = v.get("codeg") {
@@ -199,15 +199,15 @@ async fn post_api<T: Serialize + ?Sized>(
     let server_url = config().server_url.trim().to_string();
     let token = config().token.trim().to_string();
     if server_url.is_empty() {
-        return Err("CodeG 服务器地址未配置".into());
+        return Err("Codeg 服务器地址未配置".into());
     }
     if token.is_empty() {
-        return Err("CodeG 服务器 Token 未配置".into());
+        return Err("Codeg 服务器 Token 未配置".into());
     }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .build()
-        .map_err(|e| format!("CodeG HTTP 客户端创建失败：{e}"))?;
+        .map_err(|e| format!("Codeg HTTP 客户端创建失败：{e}"))?;
     let url = {
         let base = server_url.trim_end_matches('/');
         format!("{base}/api/{command}")
@@ -218,17 +218,17 @@ async fn post_api<T: Serialize + ?Sized>(
         .json(body)
         .send()
         .await
-        .map_err(|e| format!("CodeG 请求失败：{e}"))?;
+        .map_err(|e| format!("Codeg 请求失败：{e}"))?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if status.is_success() {
         serde_json::from_str(&text)
-            .map_err(|e| format!("CodeG 返回不是有效 JSON：{e}（{}）", text.trim()))
+            .map_err(|e| format!("Codeg 返回不是有效 JSON：{e}（{}）", text.trim()))
     } else if status.as_u16() == 401 {
-        Err(format!("CodeG Token 无效或未授权（HTTP 401）：{}", text.trim()))
+        Err(format!("Codeg Token 无效或未授权（HTTP 401）：{}", text.trim()))
     } else {
         Err(format!(
-            "CodeG 接口错误（HTTP {}）：{}",
+            "Codeg 接口错误（HTTP {}）：{}",
             status.as_u16(),
             text.trim()
         ))
@@ -272,7 +272,7 @@ struct CodegSnapshot {
     live_message: Option<LiveMessageInfo>,
     #[serde(default)]
     usage: Option<UsageInfo>,
-    // 补充字段：CodeG snapshot 可能返回的会话名称相关字段
+    // 补充字段：Codeg snapshot 可能返回的会话名称相关字段
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -431,7 +431,7 @@ async fn fetch_session_summaries(
     let raw_conns = post_api("acp_list_connections", &serde_json::json!({})).await?;
     let conns: Vec<CodegConnection> =
         serde_json::from_value(raw_conns)
-            .map_err(|e| format!("解析 CodeG 连接列表失败：{e}"))?;
+            .map_err(|e| format!("解析 Codeg 连接列表失败：{e}"))?;
 
     let title_map = fetch_conversation_titles().await;
     let recovery_now = recover && should_run_recovery();
@@ -476,12 +476,12 @@ async fn fetch_session_summaries(
 
         // 错误状态：每 60 秒检查一次，自动重试（先 cancel 后 prompt）。
         // 运行/连接中无输出：按不活跃阈值触发同样恢复。
-        // 仅在 CodeG API 正常（2xx）且到了恢复检查窗口时才做。
+        // 仅在 Codeg API 正常（2xx）且到了恢复检查窗口时才做。
         if recovery_now && summary.waiting_for.is_none() {
             let error_reason = if is_error(&summary.status) {
-                Some(format!("CodeG 会话进入错误状态（{}）", summary.status))
+                Some(format!("Codeg 会话进入错误状态（{}）", summary.status))
             } else if is_stopped(&summary.status) {
-                Some(format!("CodeG 会话已停止（{}），尝试重启", summary.status))
+                Some(format!("Codeg 会话已停止（{}），尝试重启", summary.status))
             } else {
                 None
             };
@@ -556,10 +556,10 @@ pub async fn codeg_status() -> Result<CodegStatus, String> {
     let auto_recovery = config().auto_recovery;
     let inactivity_timeout_secs = config().inactivity_timeout_secs;
     if !enabled {
-        return Err("CodeG 行显示已关闭".into());
+        return Err("Codeg 行显示已关闭".into());
     }
     if !configured {
-        return Err("CodeG 服务器地址或 Token 未配置".into());
+        return Err("Codeg 服务器地址或 Token 未配置".into());
     }
 
     let mut events = Vec::new();
@@ -603,7 +603,7 @@ pub async fn codeg_status() -> Result<CodegStatus, String> {
 
 // ──────────────── 会话操作封装 ────────────────
 
-/// 可扩展的 CodeG 会话操作。当前可直接对接 Codeg web API；
+/// 可扩展的 Codeg 会话操作。当前可直接对接 Codeg web API；
 /// 后续可在不改变调用方的前提下增加重试、审计或 UI 触发。
 pub async fn session_action(
     action: &str,
@@ -639,7 +639,7 @@ pub async fn session_action(
             &serde_json::json!({ "connectionId": connection_id }),
         )
         .await,
-        other => Err(format!("不支持的 CodeG 会话操作：{other}")),
+        other => Err(format!("不支持的 Codeg 会话操作：{other}")),
     }
 }
 

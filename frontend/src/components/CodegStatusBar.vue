@@ -2,7 +2,7 @@
   <section v-if="show" class="codeg-dock" :class="{ error: !!status.error }">
     <div v-if="status.error" class="codeg-error-banner">
       <span class="dot"></span>
-      <span>CodeG 未连接</span>
+      <span>Codeg 未连接</span>
       <span class="codeg-err-text">{{ status.error }}</span>
       <button class="codeg-refresh" @click="refresh">刷新</button>
     </div>
@@ -236,7 +236,7 @@ async function refresh() {
     const r = await invoke('get_codeg_status')
     status.value = r || {}
     if (!r?.connected) {
-      status.value.error = status.value.error || 'CodeG 服务器未连接'
+      status.value.error = status.value.error || 'Codeg 服务器未连接'
     }
   } catch (e) {
     status.value = { ...status.value, connected: false, error: String(e) }

@@ -189,14 +189,14 @@ struct CodegSettingsResponse {
     config: codeg::CodegConfig,
 }
 
-/// 获取 CodeG 服务器设置
+/// 获取 Codeg 服务器设置
 #[tauri::command]
 fn get_codeg_settings() -> CodegSettingsResponse {
     let cfg = parse_saved_config(codeg::load_from_json);
     CodegSettingsResponse { config: cfg }
 }
 
-/// 保存 CodeG 服务器设置并热更新运行时，不阻塞应用启动
+/// 保存 Codeg 服务器设置并热更新运行时，不阻塞应用启动
 #[tauri::command]
 fn set_codeg_settings(config: codeg::CodegConfig) -> Result<CodegSettingsResponse, String> {
     let path = config_path().ok_or("无法确定配置文件路径")?;
@@ -214,7 +214,7 @@ fn set_codeg_settings(config: codeg::CodegConfig) -> Result<CodegSettingsRespons
     Ok(CodegSettingsResponse { config: saved })
 }
 
-/// 获取 CodeG 实时状态：会话数量、运行/停止/等待输入、活跃名称、进程与资源占用
+/// 获取 Codeg 实时状态：会话数量、运行/停止/等待输入、活跃名称、进程与资源占用
 #[tauri::command]
 async fn get_codeg_status() -> Result<codeg::CodegStatus, String> {
     codeg::codeg_status().await
@@ -628,7 +628,7 @@ fn main() {
             let saved_max_conc: usize = read_saved_config_str("max_concurrency")
                 .parse()
                 .unwrap_or(20);
-            // CodeG 配置独立加载；未配置时保持默认，不阻塞应用启动
+            // Codeg 配置独立加载；未配置时保持默认，不阻塞应用启动
             let codeg_config_v: serde_json::Value = parse_saved_config(serde_json::Value::clone);
             codeg::load_from_json(&codeg_config_v);
             // 余额与探针配置同样独立加载，缺省即用默认值

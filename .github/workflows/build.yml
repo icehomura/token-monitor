@@ -215,12 +215,12 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: "Token Monitor ${{ steps.tag.outputs.tag }}"
           files: |
-            artifacts/windows/*.exe
-            artifacts/macos-x64/*.dmg
-            artifacts/macos-arm64/*.dmg
-            artifacts/linux-x86_64/*.AppImage
-            artifacts/linux-x86_64/*.deb
-            artifacts/linux-aarch64/*.AppImage
-            artifacts/linux-aarch64/*.deb
+            artifacts/windows/**/*.exe
+            artifacts/macos-x64/**/*.dmg
+            artifacts/macos-arm64/**/*.dmg
+            artifacts/linux-x86_64/**/*.AppImage
+            artifacts/linux-x86_64/**/*.deb
+            artifacts/linux-aarch64/**/*.AppImage
+            artifacts/linux-aarch64/**/*.deb
           draft: true
           generate_release_notes: true

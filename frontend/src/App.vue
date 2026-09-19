@@ -142,7 +142,7 @@ onMounted(async () => {
       updateCodegBar(!!(r.config?.enabled))
     } catch {}
   })
-  // 加载 CodeG 显示开关；未配置时保持隐藏
+  // 加载 Codeg 显示开关；未配置时保持隐藏
   await rememberWindowHeight()
   try {
     const r = await invoke('get_codeg_settings')
@@ -181,7 +181,7 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-rows: auto 1fr;
   gap: 16px;
-  /* 需扣除标题栏 40 + toolbar 46 + 探针行 36（开启时）+ CodeG 行 */
+  /* 需扣除标题栏 40 + toolbar 46 + 探针行 36（开启时）+ Codeg 行 */
   height: calc(100vh - 40px - 46px - var(--probe-bar-height, 0px) - var(--codeg-bar-height, 0px));
   overflow: hidden;
 }

@@ -316,7 +316,8 @@ onBeforeUnmount(() => {
   overflow: hidden;
   padding: 0 16px;
   background: var(--panel);
-  border-bottom: 1px solid var(--border);
+  border: 1px solid var(--border);
+  border-radius: 8px;
   font-size: 12px;
   line-height: 1;
   white-space: nowrap;
@@ -411,6 +412,7 @@ onBeforeUnmount(() => {
   gap: 1px;
   margin-left: auto;
   flex: 0 0 auto;
+  min-width: 120px;
   height: 14px;
 }
 

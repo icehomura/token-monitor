@@ -5,7 +5,7 @@
         <div class="modal-head">
           <div>
             <h2>设置</h2>
-            <p class="modal-sub">管理 API 配置文件与系统设置</p>
+            <p class="modal-sub">管理 AI 服务、探针与系统设置</p>
           </div>
           <IconButton class="modal-close" title="关闭" @click="$emit('close')">
             <span style="font-size:15px">✕</span>
@@ -31,7 +31,7 @@
         <!-- ── Tab：AI 服务 ── -->
         <div v-show="activeTab === 'ai'" class="tab-pane">
         <!-- 配置文件管理 -->
-        <SettingsCard title="API 配置文件" description="管理多组 API 地址、模型和密钥配置，点击切换激活" auto>
+        <SettingsCard title="AI 服务配置" description="管理多组 API 地址、模型和密钥配置，点击切换激活" auto>
           <template #actions>
             <BaseButton variant="primary" @click="addNewProfile">
               <span style="margin-right:4px">+</span> 新建配置文件
@@ -66,30 +66,10 @@
           </template>
         </SettingsCard>
 
+        </div><!-- /Tab AI 服务 -->
 
-
-        <!-- 第一行：当前状态 + 端口 -->
-        <div class="grid-2">
-          <SettingsCard title="当前状态">
-            <div class="status-row">
-              <span class="status-icon">✓</span>
-              <span class="status-text">{{ settingsInfo }}</span>
-            </div>
-          </SettingsCard>
-          <SettingsCard title="服务端口" description="保存后自动重启监听">
-            <div class="port-row">
-              <BaseInput v-model.number="port" type="number" :min="1" :max="65535" spinner />
-              <BaseButton variant="primary" @click="savePort">
-                <span style="margin-right:4px">⟳</span> 保存并重启
-              </BaseButton>
-            </div>
-            <template #hint>
-              <small :class="['ff-hint', portMsgType]">{{ portMsg }}</small>
-            </template>
-          </SettingsCard>
-        </div>
-
-        <!-- 探针设置 -->
+        <!-- ── Tab：探针 ── -->
+        <div v-show="activeTab === 'probe'" class="tab-pane">
         <SettingsCard title="探针设置" description="定期探测上游服务可用性">
           <div class="settings-row">
             <span class="settings-label">探针开关</span>
@@ -106,8 +86,7 @@
             <small :class="['ff-hint', probeMsgType]">{{ probeMsg }}</small>
           </template>
         </SettingsCard>
-
-        </div><!-- /Tab AI 服务 -->
+        </div><!-- /Tab 探针 -->
 
         <!-- ── Tab：余额 ── -->
         <div v-show="activeTab === 'balance'" class="tab-pane">
@@ -139,10 +118,10 @@
 
         </div><!-- /Tab 余额 -->
 
-        <!-- ── Tab：CodeG ── -->
+        <!-- ── Tab：Codeg ── -->
         <div v-show="activeTab === 'codeg'" class="tab-pane">
-        <!-- CodeG 服务器 -->
-        <SettingsCard title="CodeG 服务器" description="连接 Codeg server，在 Token Monitor 底部显示并监控活跃会话" stretch>
+        <!-- Codeg 服务器 -->
+        <SettingsCard title="Codeg 服务器" description="连接 Codeg server，在 Token Monitor 底部显示并监控活跃会话" stretch>
           <div class="codeg-grid">
             <div class="codeg-field">
               <span class="codeg-label">服务器地址</span>
@@ -158,7 +137,7 @@
               </div>
             </div>
             <div class="codeg-field codeg-toggle">
-              <span class="codeg-label">底部 CodeG 行</span>
+              <span class="codeg-label">底部 Codeg 行</span>
               <BaseToggle v-model="codegEnabled" labelOn="已开启" labelOff="已关闭" />
             </div>
             <div class="codeg-field codeg-toggle">
@@ -171,7 +150,7 @@
               <BaseInput v-model.number="codegTimeout" type="number" :min="10" spinner />
             </div>
             <div class="codeg-field codeg-actions">
-              <BaseButton variant="primary" @click="saveCodeg">保存 CodeG 配置</BaseButton>
+              <BaseButton variant="primary" @click="saveCodeg">保存 Codeg 配置</BaseButton>
             </div>
           </div>
           <template #hint>
@@ -179,10 +158,31 @@
           </template>
         </SettingsCard>
 
-        </div><!-- /Tab CodeG -->
+        </div><!-- /Tab Codeg -->
 
         <!-- ── Tab：界面与系统 ── -->
         <div v-show="activeTab === 'system'" class="tab-pane">
+        <!-- 当前状态 + 端口 -->
+        <div class="grid-2">
+          <SettingsCard title="当前状态">
+            <div class="status-row">
+              <span class="status-icon">✓</span>
+              <span class="status-text">{{ settingsInfo }}</span>
+            </div>
+          </SettingsCard>
+          <SettingsCard title="服务端口" description="保存后自动重启监听">
+            <div class="port-row">
+              <BaseInput v-model.number="port" type="number" :min="1" :max="65535" spinner />
+              <BaseButton variant="primary" @click="savePort">
+                <span style="margin-right:4px">⟳</span> 保存并重启
+              </BaseButton>
+            </div>
+            <template #hint>
+              <small :class="['ff-hint', portMsgType]">{{ portMsg }}</small>
+            </template>
+          </SettingsCard>
+        </div>
+
         <!-- 两列：单位转换 + 并发数 -->
         <div class="grid-2">
           <SettingsCard title="词元数量单位转换" description="开启后超过 1000 显示为 K / M / B，保留 1 位小数" modifier="unit">
@@ -291,8 +291,9 @@ const DEFAULT_TAB = 'ai'
 const activeTab = ref(DEFAULT_TAB)
 const tabs = [
   { id: 'ai', label: 'AI 服务' },
+  { id: 'probe', label: '探针' },
   { id: 'balance', label: '余额' },
-  { id: 'codeg', label: 'CodeG' },
+  { id: 'codeg', label: 'Codeg' },
   { id: 'system', label: '界面与系统' },
 ]
 
@@ -368,7 +369,7 @@ function clampInterval(v) {
   return Math.min(1800, Math.max(1, Math.round(n)))
 }
 
-// ──────── CodeG 服务器状态 ────────
+// ──────── Codeg 服务器状态 ────────
 const codegEnabled = ref(false)
 const codegUrl = ref('http://127.0.0.1:3080')
 const codegToken = ref('')
@@ -408,7 +409,7 @@ watch(() => props.visible, async (v) => {
   try {
     autostart.value = await invoke('get_autostart')
   } catch {}
-  // 加载 CodeG 配置
+  // 加载 Codeg 配置
   try {
     const c = await invoke('get_codeg_settings')
     const cfg = c.config || {}
@@ -527,7 +528,7 @@ function onProfileSave(profile) {
   })
 }
 
-// ──────── CodeG ────────
+// ──────── Codeg ────────
 async function saveCodeg() {
   codegMsg.value = '保存中…'; codegMsgType.value = ''
   const cfg = {
@@ -539,7 +540,7 @@ async function saveCodeg() {
   }
   try {
     const r = await invoke('set_codeg_settings', { config: cfg })
-    codegMsg.value = `✓ 已保存${r.config.enabled ? '，CodeG 行已开启' : '，CodeG 行已关闭'}`
+    codegMsg.value = `✓ 已保存${r.config.enabled ? '，Codeg 行已开启' : '，Codeg 行已关闭'}`
     codegMsgType.value = 'ok'
   } catch (e) {
     codegMsg.value = String(e); codegMsgType.value = 'err'
@@ -756,7 +757,7 @@ async function savePort() {
 .port-row { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; }
 .port-row .input-wrap { flex: 0 0 150px; min-width: 0; }
 
-/* CodeG 服务器 */
+/* Codeg 服务器 */
 .codeg-grid {
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;
