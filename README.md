@@ -2,6 +2,28 @@
 
 Tauri 2 桌面应用：Trae 兼容 API 代理（Rust 后端）+ RPM/TPM 实时统计。
 
+## 下载安装
+
+从 [GitHub Releases](https://github.com/icehomura/token-monitor/releases/latest) 下载对应平台的安装包：
+
+| 平台 | 文件 | 说明 |
+|------|------|------|
+| Windows x64 | `*_x64-setup.exe` | NSIS 安装包，双击运行 |
+| macOS Apple Silicon | `*_aarch64.dmg` | M1/M2/M3/M4 芯片 |
+| macOS Intel | `*_x64.dmg` | Intel 芯片 |
+| Linux x86_64 | `*_amd64.AppImage` / `*.deb` | AppImage 直接运行；deb 用 `dpkg -i` 安装 |
+| Linux ARM64 | `*_aarch64.AppImage` / `*.deb` | 树莓派等 ARM 设备 |
+
+### macOS 注意事项
+
+macOS 会拦截未签名的应用，首次打开需要在终端执行：
+
+```bash
+xattr -cr /Applications/Token\ Monitor.app
+```
+
+或者：系统设置 → 隐私与安全性 → 点击「仍要打开」。
+
 ## 功能
 
 - **代理服务**：程序启动即自动运行在 `http://127.0.0.1:8188`，支持三种 API 格式输入，统一转发到上游：
@@ -75,6 +97,18 @@ frontend/style.css    前端样式
 src/main.rs           入口：托盘、关窗隐藏、配置加载、启动服务
 src/proxy.rs          代理：三种格式转换 + SSE 流式 + 重试 + 统计上报
 src/stats.rs          RPM/TPM 整分钟分桶
+src/codeg.rs          Codeg 服务器连接与会话聚合
+src/balance.rs        余额查询
+src/probe.rs          AI 服务探针
 icons/icon.svg        1024x1024 矢量原图
 scripts/gen_icons.sh  SVG -> PNG(Chrome headless) -> 全套位图(Pillow)
+```
+
+## CI/CD
+
+推送到 `main` 不会自动构建。打 tag 后自动构建全平台产物并创建 Release：
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
 ```
