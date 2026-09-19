@@ -115,7 +115,42 @@ fn proxy_port() -> u16 {
     })
 }
 
+/// 包外数据目录覆盖。返回 None 表示沿用「exe 同目录」的既有行为。
+///
+/// - macOS：应用是 `.app` 包，exe 位于 `Contents/MacOS/`，DMG 升级整包替换，
+///   写在包内的配置/数据库/日志会随旧版本消失。改用
+///   `~/Library/Application Support/<bundle id>/`（bundle id 见 tauri.conf.json）。
+/// - Linux：AppImage 是只读 squashfs，exe 位于 `/tmp/.mount_XXXXXX/`，
+///   既不可写、每次启动路径还不同。`$APPIMAGE` 指向用户手里真实的 .AppImage
+///   文件，把数据放它旁边即可持久化。deb / 手动运行没有该变量，返回 None。
+/// - Windows：exe 目录是稳定文件夹，不需要覆盖。
+#[cfg(target_os = "macos")]
+pub(crate) fn app_data_override() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let dir = home.join("Library/Application Support/com.hlw.token-monitor");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn app_data_override() -> Option<std::path::PathBuf> {
+    std::env::var_os("APPIMAGE")
+        .map(std::path::PathBuf::from)
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn app_data_override() -> Option<std::path::PathBuf> {
+    None
+}
+
 pub(crate) fn config_path() -> Option<std::path::PathBuf> {
+    // macOS：配置固定读写包外目录（见 app_data_override）
+    if let Some(dir) = app_data_override() {
+        return Some(dir.join("token-monitor.json"));
+    }
     [
         std::env::current_exe().ok().map(|d| {
             d.parent()
@@ -448,18 +483,24 @@ fn apply_profile(p: &Profile) -> Result<(), String> {
 }
 
 fn read_api_key() -> String {
-    // 只认 JSON 配置：exe 同目录 / 工作目录的 token-monitor.json {"api_key": "..."}
-    let candidates: Vec<std::path::PathBuf> = [
-        std::env::current_dir().ok().map(|d| d.join("token-monitor.json")),
-        std::env::current_exe().ok().map(|d| {
-            d.parent()
-                .unwrap_or(std::path::Path::new("."))
-                .join("token-monitor.json")
-        }),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    // 只认 JSON 配置：包外数据目录（仅 macOS）/ 工作目录 / exe 同目录
+    // 的 token-monitor.json {"api_key": "..."}
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(dir) = app_data_override() {
+        candidates.push(dir.join("token-monitor.json"));
+    }
+    candidates.extend(
+        [
+            std::env::current_dir().ok().map(|d| d.join("token-monitor.json")),
+            std::env::current_exe().ok().map(|d| {
+                d.parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join("token-monitor.json")
+            }),
+        ]
+        .into_iter()
+        .flatten(),
+    );
     for candidate in candidates {
         if let Ok(text) = std::fs::read_to_string(&candidate) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -494,33 +535,43 @@ where
     T::default()
 }
 
+/// 配置文件查找顺序：包外数据目录（仅 macOS）→ exe 同目录 → 工作目录
 fn config_candidates() -> Vec<std::path::PathBuf> {
-    vec![
-        std::env::current_exe().ok().map(|d| {
-            d.parent()
-                .unwrap_or(std::path::Path::new("."))
-                .join("token-monitor.json")
-        }),
-        std::env::current_dir().ok().map(|d| d.join("token-monitor.json")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(dir) = app_data_override() {
+        out.push(dir.join("token-monitor.json"));
+    }
+    out.extend(
+        [
+            std::env::current_exe().ok().map(|d| {
+                d.parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join("token-monitor.json")
+            }),
+            std::env::current_dir().ok().map(|d| d.join("token-monitor.json")),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    out
 }
 
-/// 将消息追加写入 exe 旁的 crash.log
+/// 将消息追加写入 crash.log：macOS 写在包外数据目录，其他平台在 exe 旁
 fn write_crash_log(msg: &str) {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let path = dir.join("crash.log");
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-            {
-                let _ = f.write_all(msg.as_bytes());
-            }
+    let dir = app_data_override().or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+    });
+    if let Some(dir) = dir {
+        let path = dir.join("crash.log");
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = f.write_all(msg.as_bytes());
         }
     }
     eprintln!("{msg}");

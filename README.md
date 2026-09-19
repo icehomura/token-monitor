@@ -43,7 +43,18 @@ xattr -cr /Applications/Token\ Monitor.app
 
 ## 配置
 
-配置**只从 `token-monitor.json` 读取**（不再支持环境变量）。放在 exe 同目录或工作目录均可，exe 同目录优先。
+配置**只从 `token-monitor.json` 读取**（不再支持环境变量）。
+
+**配置文件位置按平台区分**（数据库 `token-monitor-data.db` 与 `crash.log` 同目录）：
+
+| 平台 | 位置 | 原因 |
+|---|---|---|
+| Windows | exe 同目录 → 工作目录 | exe 目录是稳定文件夹 |
+| macOS | `~/Library/Application Support/com.hlw.token-monitor/` | exe 位于 `.app` 包内，DMG 升级会整包替换，写在包内必丢 |
+| Linux AppImage | `.AppImage` 文件同目录 | AppImage 挂载点是只读临时目录，每次启动路径都变 |
+| Linux deb | 二进制同目录 → 工作目录 | 未做特殊处理 |
+
+> **macOS / AppImage 首次使用需手动放置配置**：程序不会自动迁移旧数据，请在上述目录新建 `token-monitor.json`（可参考 `token-monitor.example.json`）。配置也可全部在设置界面里改，程序会写回该目录。
 
 ```json
 {

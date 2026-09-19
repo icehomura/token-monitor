@@ -45,7 +45,13 @@ static ACTIVE: AtomicU64 = AtomicU64::new(0);
 
 // ──────────────── 初始化 ────────────────
 
+/// 数据库与旧版数据的存放位置。
+/// macOS 在 `.app` 包外、Linux AppImage 在 .AppImage 文件旁，避免升级即丢失；
+/// 其余情况仍是 exe 同目录。详见 main.rs 的 app_data_override。
 fn db_path() -> std::path::PathBuf {
+    if let Some(dir) = crate::app_data_override() {
+        return dir.join("token-monitor-data.db");
+    }
     std::env::current_exe()
         .ok()
         .and_then(|d| d.parent().map(|p| p.join("token-monitor-data.db")))
@@ -53,6 +59,9 @@ fn db_path() -> std::path::PathBuf {
 }
 
 fn legacy_data_path() -> std::path::PathBuf {
+    if let Some(dir) = crate::app_data_override() {
+        return dir.join("token-monitor-data.json");
+    }
     std::env::current_exe()
         .ok()
         .and_then(|d| d.parent().map(|p| p.join("token-monitor-data.json")))
