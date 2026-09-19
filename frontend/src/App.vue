@@ -1,5 +1,5 @@
 <template>
-  <div class="app-shell" :style="{ '--codeg-bar-height': codegBarVisible ? '220px' : '0px' }">
+  <div class="app-shell" :style="{ '--codeg-bar-height': codegBarVisible ? '220px' : '0px', '--probe-bar-height': probeBarVisible ? '36px' : '0px' }">
   <TitleBar
     :concurrency="stats.concurrency"
     @open-settings="showSettings = true"
@@ -8,6 +8,8 @@
     ref="toolbarRef"
     @range-change="onRangeChange"
   />
+  <!-- 第三行：AI 服务探针 -->
+  <AiProbeBar @visible-change="onProbeVisible" />
   <section class="main-area">
     <StatsCards
        :stats="stats"
@@ -43,6 +45,7 @@
 import { ref, onMounted, onBeforeUnmount } from 'vue'
 import TitleBar from './components/TitleBar.vue'
 import Toolbar from './components/Toolbar.vue'
+import AiProbeBar from './components/AiProbeBar.vue'
 import StatsCards from './components/StatsCards.vue'
 import RpmChart from './components/RpmChart.vue'
 import CodegStatusBar from './components/CodegStatusBar.vue'
@@ -62,8 +65,11 @@ const showCloseDialog = ref(false)
 const convertUnits = ref(getConvertUnits())
 const toolbarRef = ref(null)
 const codegBarVisible = ref(false)
+// 探针行的实际显隐（由 AiProbeBar 自持，通过 visible-change 上报），用于高度计算
+const probeBarVisible = ref(false)
+function onProbeVisible(v) { probeBarVisible.value = !!v }
 const BASE_WINDOW_HEIGHT = 640
-const CODEG_DOCK_HEIGHT = 180
+const CODEG_DOCK_HEIGHT = 240
 let baseWindowHeight = BASE_WINDOW_HEIGHT
 
 async function rememberWindowHeight() {
@@ -175,7 +181,8 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-rows: auto 1fr;
   gap: 16px;
-  height: calc(100vh - 40px - 46px - var(--codeg-bar-height, 0px));
+  /* 需扣除标题栏 40 + toolbar 46 + 探针行 36（开启时）+ CodeG 行 */
+  height: calc(100vh - 40px - 46px - var(--probe-bar-height, 0px) - var(--codeg-bar-height, 0px));
   overflow: hidden;
 }
 </style>

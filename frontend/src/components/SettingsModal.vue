@@ -12,7 +12,24 @@
           </IconButton>
         </div>
 
+        <!-- Tab 条：用 v-show 切换，保证各卡片内部状态与 watch 不被销毁 -->
+        <div class="tabs">
+          <button
+            v-for="tab in tabs"
+            :key="tab.id"
+            class="tab-btn"
+            :class="{ active: activeTab === tab.id }"
+            @click="activeTab = tab.id"
+          >
+            {{ tab.label }}
+          </button>
+        </div>
+
         <div class="modal-body">
+        <div class="tab-content">
+
+        <!-- ── Tab：AI 服务 ── -->
+        <div v-show="activeTab === 'ai'" class="tab-pane">
         <!-- 配置文件管理 -->
         <SettingsCard title="API 配置文件" description="管理多组 API 地址、模型和密钥配置，点击切换激活" auto>
           <template #actions>
@@ -72,6 +89,58 @@
           </SettingsCard>
         </div>
 
+        <!-- 探针设置 -->
+        <SettingsCard title="探针设置" description="定期探测上游服务可用性">
+          <div class="settings-row">
+            <span class="settings-label">探针开关</span>
+            <BaseToggle v-model="probeEnabled" />
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">探测间隔（秒）</span>
+            <BaseInput v-model.number="probeInterval" type="number" spinner :min="1" :max="1800" />
+          </div>
+          <div class="settings-actions">
+            <BaseButton variant="primary" @click="saveProbe">保存探针设置</BaseButton>
+          </div>
+          <template #hint>
+            <small :class="['ff-hint', probeMsgType]">{{ probeMsg }}</small>
+          </template>
+        </SettingsCard>
+
+        </div><!-- /Tab AI 服务 -->
+
+        <!-- ── Tab：余额 ── -->
+        <div v-show="activeTab === 'balance'" class="tab-pane">
+        <!-- 余额设置 -->
+        <SettingsCard title="余额设置" description="定期查询上游账户余额">
+          <div class="settings-row">
+            <span class="settings-label">余额查询开关</span>
+            <BaseToggle v-model="balanceEnabled" />
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">货币单位</span>
+            <DdSelect :options="currencyOptions" v-model="balanceCurrency" />
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">查询间隔（秒）</span>
+            <BaseInput v-model.number="balanceInterval" type="number" spinner :min="1" :max="1800" />
+          </div>
+          <div class="settings-row">
+            <span class="settings-label">当前余额</span>
+            <span :class="['ff-hint', balanceInfoType]">{{ balanceInfo }}</span>
+          </div>
+          <div class="settings-actions">
+            <BaseButton variant="primary" @click="saveBalance">保存余额设置</BaseButton>
+          </div>
+          <template #hint>
+            <small :class="['ff-hint', balanceMsgType]">{{ balanceMsg }}</small>
+          </template>
+        </SettingsCard>
+
+        </div><!-- /Tab 余额 -->
+
+        <!-- ── Tab：CodeG ── -->
+        <div v-show="activeTab === 'codeg'" class="tab-pane">
         <!-- CodeG 服务器 -->
         <SettingsCard title="CodeG 服务器" description="连接 Codeg server，在 Token Monitor 底部显示并监控活跃会话" stretch>
           <div class="codeg-grid">
@@ -110,6 +179,10 @@
           </template>
         </SettingsCard>
 
+        </div><!-- /Tab CodeG -->
+
+        <!-- ── Tab：界面与系统 ── -->
+        <div v-show="activeTab === 'system'" class="tab-pane">
         <!-- 两列：单位转换 + 并发数 -->
         <div class="grid-2">
           <SettingsCard title="词元数量单位转换" description="开启后超过 1000 显示为 K / M / B，保留 1 位小数" modifier="unit">
@@ -171,7 +244,9 @@
           </div>
         </SettingsCard>
 
-        </div>
+        </div><!-- /Tab 界面与系统 -->
+        </div><!-- /tab-content -->
+        </div><!-- /modal-body -->
 
         <!-- 底部 -->
         <div class="modal-footer">
@@ -210,6 +285,16 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['close', 'update:themeName', 'update:convertUnits'])
+
+// ──────── Tab 分组 ────────
+const DEFAULT_TAB = 'ai'
+const activeTab = ref(DEFAULT_TAB)
+const tabs = [
+  { id: 'ai', label: 'AI 服务' },
+  { id: 'balance', label: '余额' },
+  { id: 'codeg', label: 'CodeG' },
+  { id: 'system', label: '界面与系统' },
+]
 
 const themeOptions = [
   { v: 'dark', label: '深色', desc: '暗色护眼', icon: 'dark' },
@@ -256,6 +341,33 @@ const autostart = ref(false)
 const autostartMsg = ref('')
 const autostartMsgType = ref('')
 
+// ──────── 探针设置状态 ────────
+const probeEnabled = ref(false)
+const probeInterval = ref(15)
+const probeMsg = ref('')
+const probeMsgType = ref('')
+
+// ──────── 余额设置状态 ────────
+const balanceEnabled = ref(false)
+const balanceCurrency = ref('CNY')
+const balanceInterval = ref(15)
+const balanceMsg = ref('')
+const balanceMsgType = ref('')
+const balanceInfo = ref('—')       // 只读的当前余额展示
+const balanceInfoType = ref('')    // '' 为灰色提示，'ok' 为绿色
+
+const currencyOptions = [
+  { v: 'CNY', label: '人民币 (CNY)' },
+  { v: 'USD', label: '美元 (USD)' },
+]
+
+// 间隔统一裁剪到 1~1800 秒，非法值回落到默认 15
+function clampInterval(v) {
+  const n = Number(v)
+  if (!Number.isFinite(n) || n <= 0) return 15
+  return Math.min(1800, Math.max(1, Math.round(n)))
+}
+
 // ──────── CodeG 服务器状态 ────────
 const codegEnabled = ref(false)
 const codegUrl = ref('http://127.0.0.1:3080')
@@ -273,6 +385,8 @@ const _loadingSettings = ref(true)
 watch(() => props.visible, async (v) => {
   if (!v) return
   _loadingSettings.value = true
+  // 每次打开都回到默认 Tab
+  activeTab.value = DEFAULT_TAB
   // 加载 profiles
   try {
     const r = await invoke('get_profiles')
@@ -304,6 +418,23 @@ watch(() => props.visible, async (v) => {
     codegAutoRecovery.value = cfg.auto_recovery !== false
     codegTimeout.value = cfg.inactivity_timeout_secs || 120
   } catch {}
+  // 加载探针设置
+  try {
+    const p = await invoke('get_probe_settings') || {}
+    const cfg = p.config || p
+    probeEnabled.value = !!cfg.enabled
+    probeInterval.value = clampInterval(cfg.interval_secs)
+  } catch {}
+  // 加载余额设置
+  try {
+    const b = await invoke('get_balance_settings') || {}
+    const cfg = b.config || b
+    balanceEnabled.value = !!cfg.enabled
+    balanceCurrency.value = cfg.currency || 'CNY'
+    balanceInterval.value = clampInterval(cfg.interval_secs)
+  } catch {}
+  // 加载当前余额（只读展示）
+  await refreshBalance()
   _loadingSettings.value = false
 })
 
@@ -336,6 +467,13 @@ watch(autostart, async (v) => {
   } catch (e) {
     autostartMsg.value = String(e); autostartMsgType.value = 'err'
   }
+})
+
+// 余额开关变化时同步一次只读状态行（保存仍由按钮触发）
+watch(balanceEnabled, async (v) => {
+  if (_loadingSettings.value) return
+  if (!v) { balanceInfo.value = '—'; balanceInfoType.value = ''; return }
+  await refreshBalance()
 })
 
 // ──────── Profile 操作 ────────
@@ -408,6 +546,70 @@ async function saveCodeg() {
   }
 }
 
+// ──────── 探针 ────────
+async function saveProbe() {
+  probeMsg.value = '保存中…'; probeMsgType.value = ''
+  const cfg = {
+    enabled: probeEnabled.value,
+    interval_secs: clampInterval(probeInterval.value),
+  }
+  try {
+    const r = await invoke('set_probe_settings', { config: cfg }) || {}
+    // 用后端返回的配置回填
+    const saved = r.config || r
+    probeEnabled.value = !!saved.enabled
+    probeInterval.value = clampInterval(saved.interval_secs)
+    probeMsg.value = `✓ 已保存${probeEnabled.value ? '，探针已开启' : '，探针已关闭'}`
+    probeMsgType.value = 'ok'
+  } catch (e) {
+    probeMsg.value = String(e); probeMsgType.value = 'err'
+  }
+}
+
+// ──────── 余额 ────────
+async function saveBalance() {
+  balanceMsg.value = '保存中…'; balanceMsgType.value = ''
+  const cfg = {
+    enabled: balanceEnabled.value,
+    currency: balanceCurrency.value,
+    interval_secs: clampInterval(balanceInterval.value),
+  }
+  try {
+    const r = await invoke('set_balance_settings', { config: cfg }) || {}
+    // 用后端返回的配置回填
+    const saved = r.config || r
+    balanceEnabled.value = !!saved.enabled
+    balanceCurrency.value = saved.currency || 'CNY'
+    balanceInterval.value = clampInterval(saved.interval_secs)
+    balanceMsg.value = `✓ 已保存${balanceEnabled.value ? '，余额查询已开启' : '，余额查询已关闭'}`
+    balanceMsgType.value = 'ok'
+    await refreshBalance()
+  } catch (e) {
+    balanceMsg.value = String(e); balanceMsgType.value = 'err'
+  }
+}
+
+// 读取当前余额，填充只读状态行（不可用属于正常状态，用灰色而非红色）
+async function refreshBalance() {
+  try {
+    const b = await invoke('get_balance') || {}
+    if (b.supported === false) {
+      balanceInfo.value = b.reason || '当前上游不支持余额查询'
+      balanceInfoType.value = ''
+    } else if (b.available === true) {
+      const sym = (b.currency || balanceCurrency.value) === 'USD' ? '$' : '¥'
+      balanceInfo.value = `余额 ${sym}${b.total != null ? b.total : '--'}`
+      balanceInfoType.value = 'ok'
+    } else {
+      balanceInfo.value = b.reason || '余额暂不可用'
+      balanceInfoType.value = ''
+    }
+  } catch (e) {
+    balanceInfo.value = String(e)
+    balanceInfoType.value = ''
+  }
+}
+
 // ──────── 端口 ────────
 async function savePort() {
   portMsg.value = '重启中…'; portMsgType.value = ''
@@ -460,10 +662,50 @@ async function savePort() {
   border-radius: 6px;
 }
 
-.modal-body > .settings-card,
-.modal-body > .grid-2 { margin-bottom: 10px; }
-.modal-body > .grid-2:last-child { margin-bottom: 0; }
+/* Tab 条 */
+.tabs {
+  display: flex;
+  gap: 2px;
+  margin-bottom: 12px;
+  background: var(--bg);
+  border-radius: 8px;
+  padding: 3px;
+  flex-shrink: 0;
+}
+.tab-btn {
+  flex: 1;
+  padding: 7px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all .15s;
+}
+.tab-btn:hover { color: var(--text); }
+.tab-btn.active {
+  background: var(--panel);
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* 卡片间距：卡片直接位于各自 Tab 面板内 */
+.tab-pane > .settings-card,
+.tab-pane > .grid-2 { margin-bottom: 10px; }
+.tab-pane > :last-child { margin-bottom: 0; }
 .grid-2 { align-items: stretch; }
+
+/* 通用「标签 + 控件」行（探针 / 余额） */
+.settings-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; width: 100%; min-width: 0;
+}
+.settings-label { font-size: 12px; color: var(--muted); flex-shrink: 0; }
+.settings-row .input-wrap { flex: 0 0 150px; min-width: 0; }
+.settings-row .ff-hint { margin-top: 0; }
+.settings-actions { display: flex; justify-content: flex-end; width: 100%; }
 
 .ff-hint {
   display: block;

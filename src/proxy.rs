@@ -1,8 +1,8 @@
 ﻿//! Trae 兼容代理：Chat Completions / Responses / Anthropic Messages 三种输入，
-//! 统一转换为 Responses API 转发到 sub2api 上游；SSE 流式转发、5xx 重试。
+//! 统一转换为 Responses API 转发到上游；SSE 流式转发、5xx 重试。
 use crate::stats;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -13,6 +13,10 @@ use std::sync::OnceLock;
 use tauri::Emitter;
 
 const MAX_RETRIES: usize = 3;
+
+/// 单次请求体上限。axum 对 Json 提取器默认只放行 2MB，长上下文请求会被本地
+/// 直接 413 拦下（报错来自本进程，与上游无关）。这里放宽到 1GiB。
+const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Auto-incrementing request ID counter, starting from 1000
 static REQUEST_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1000);
@@ -807,9 +811,9 @@ async fn convert_stream_anthropic(
 
 // ---------- 上游请求（含重试）----------
 
-/// 软并发调度：使用配置中的 max_concurrency，超过时先等待。
-/// 最长等待 120 秒；超时后返回 429。
-async fn wait_for_slot() -> Result<stats::SlotGuard, Response> {
+/// 软并发调度：最多等待 120 秒获取一个并发槽位；返回 None 表示等待超时。
+/// 供 HTTP 代理与探针 / 余额查询共用，保证所有打上游的请求都计入并发统计。
+pub(crate) async fn acquire_slot() -> Option<stats::SlotGuard> {
     let max = cfg().max_concurrency;
     let mut waited = false;
     for _ in 0..600 {
@@ -820,26 +824,35 @@ async fn wait_for_slot() -> Result<stats::SlotGuard, Response> {
             if let Some(h) = APP_HANDLE.get() {
                 let _ = h.emit("stats-updated", ());
             }
-            return Ok(stats::SlotGuard::new(id));
+            return Some(stats::SlotGuard::new(id));
         }
         waited = true;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     eprintln!(
-        "[proxy] 并发持续占满 {}（当前 {}），等待 120s 超时，返回 429",
+        "[proxy] 并发持续占满 {}（当前 {}），等待 120s 超时",
         max,
         stats::active()
     );
-    Err((
-        StatusCode::TOO_MANY_REQUESTS,
-        Json(json!({
-            "error": {
-                "message": format!("并发请求已达上限（{}），排队等待 2 分钟仍未获取到槽位，请稍后重试", MAX_CONCURRENCY),
-                "type": "concurrency_limit_exceeded",
-            }
-        })),
-    )
-        .into_response())
+    None
+}
+
+/// 软并发调度：使用配置中的 max_concurrency，超过时先等待。
+/// 最长等待 120 秒；超时后返回 429。
+async fn wait_for_slot() -> Result<stats::SlotGuard, Response> {
+    match acquire_slot().await {
+        Some(g) => Ok(g),
+        None => Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": {
+                    "message": format!("并发请求已达上限（{}），排队等待 2 分钟仍未获取到槽位，请稍后重试", MAX_CONCURRENCY),
+                    "type": "concurrency_limit_exceeded",
+                }
+            })),
+        )
+            .into_response()),
+    }
 }
 
 async fn send_upstream(payload: &Value, user_agent: &str) -> Result<reqwest::Response, (StatusCode, Value)> {
@@ -887,7 +900,7 @@ async fn send_upstream(payload: &Value, user_agent: &str) -> Result<reqwest::Res
         match resp {
             Ok(r) => {
                 let status = r.status();
-                println!("sub2api responses status: {} (attempt {})", status.as_u16(), attempt + 1);
+                println!("[upstream] responses status: {} (attempt {})", status.as_u16(), attempt + 1);
                 if status.is_server_error() && attempt < MAX_RETRIES - 1 {
                     last_status = status;
                     last_err_body = r.text().await.unwrap_or_default();
@@ -908,7 +921,7 @@ async fn send_upstream(payload: &Value, user_agent: &str) -> Result<reqwest::Res
     }
     Err((
         last_status,
-        json!({"error": {"message": format!("Sub2API gateway error after {MAX_RETRIES} retries: {last_err_body}"), "type": "upstream_error"}}),
+        json!({"error": {"message": format!("上游网关错误（已重试 {MAX_RETRIES} 次）：{last_err_body}"), "type": "upstream_error"}}),
     ))
 }
 
@@ -1073,7 +1086,7 @@ async fn upstream_error_response(upstream: reqwest::Response) -> Response {
     let body = upstream.text().await.unwrap_or_default();
     (
         status,
-        Json(json!({"error": {"message": format!("Sub2API upstream error: {}", body), "type": "upstream_error"}})),
+        Json(json!({"error": {"message": format!("上游错误：{}", body), "type": "upstream_error"}})),
     )
         .into_response()
 }
@@ -1172,7 +1185,7 @@ async fn chat_completions(
     sse_response(rx)
 }
 
-/// 模式 2：OpenAI Responses API（/v1/responses），原样透传到 sub2api 上游
+/// 模式 2：OpenAI Responses API（/v1/responses），原样透传到上游
 async fn responses_api(
     State(_): State<()>,
     headers: axum::http::HeaderMap,
@@ -1414,5 +1427,47 @@ fn build_router() -> Router<()> {
         .route("/v1/messages", post(anthropic_messages))       // Anthropic Messages
         .route("/health", axum::routing::get(health))
         .layer(cors)
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(())
+}
+
+#[cfg(test)]
+mod body_limit_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    /// 回归保护：axum 对 Json 提取器默认只放行 2MB，长上下文请求会被本地 413 拦下。
+    /// build_router 必须放宽该上限，这里用 3MB 请求体验证不再被拦截。
+    #[tokio::test]
+    async fn accepts_body_larger_than_axum_default_two_mb() {
+        // 上游地址留空 → handler 立即返回配置错误，不会发起真实网络请求
+        *CONFIG.write().unwrap_or_else(|e| e.into_inner()) = Some(ProxyConfig {
+            api_key: "test".into(),
+            model_override: String::new(),
+            port: 0,
+            upstream_url: String::new(),
+            max_concurrency: 20,
+        });
+
+        let payload = json!({
+            "model": "test",
+            "messages": [{ "role": "user", "content": "x".repeat(3 * 1024 * 1024) }]
+        })
+        .to_string();
+        assert!(payload.len() > 2 * 1024 * 1024, "测试样本需大于 axum 默认上限");
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+
+        let response = build_router().oneshot(request).await.unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "3MB 请求体被本地 body limit 拦截，MAX_REQUEST_BODY_BYTES 未生效"
+        );
+    }
 }

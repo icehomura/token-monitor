@@ -29,7 +29,7 @@
             </div>
             <div class="res-body">
               <span class="res-label">内存</span>
-              <span class="res-value">{{ fmtBytes(status.system?.memory_used_gb) }} / {{ fmtBytes(status.system?.memory_total_gb) }}</span>
+              <span class="res-value res-value--wrap">{{ fmtBytes(status.system?.memory_used_gb) }} / {{ fmtBytes(status.system?.memory_total_gb) }}</span>
               <span class="res-sub">{{ fmtNum(status.system?.memory_percent) }}%</span>
             </div>
           </div>
@@ -39,7 +39,7 @@
             </div>
             <div class="res-body">
               <span class="res-label">GPU</span>
-              <span class="res-value" v-if="status.system?.gpu_total_gb">{{ fmtBytes(status.system?.gpu_used_gb) }} / {{ fmtBytes(status.system?.gpu_total_gb) }}</span>
+              <span class="res-value res-value--wrap" v-if="status.system?.gpu_total_gb">{{ fmtNum(status.system?.gpu_used_gb) }} GB / {{ fmtNum(status.system?.gpu_total_gb) }} GB</span>
               <span class="res-value" v-else>未检测</span>
               <span class="res-sub" v-if="status.system?.gpu_total_gb">{{ fmtNum(status.system?.gpu_percent) }}%</span>
             </div>
@@ -50,8 +50,8 @@
             </div>
             <div class="res-body">
               <span class="res-label">C 盘</span>
-              <span class="res-value">{{ fmtBytes(status.system?.c_drive_used_gb) }}</span>
-              <span class="res-sub">{{ fmtNum(status.system?.c_drive_percent) }}% · 剩余 {{ fmtBytes(status.system?.c_drive_free_gb) }}</span>
+              <span class="res-value res-value--wrap">{{ fmtBytes(status.system?.c_drive_used_gb) }}</span>
+              <span class="res-sub res-sub--wrap">{{ fmtNum(status.system?.c_drive_percent) }}% · 剩余 {{ fmtBytes(status.system?.c_drive_free_gb) }}</span>
             </div>
           </div>
           <div class="res-card">
@@ -157,8 +157,9 @@ const status = ref({ connected: false, error: null, sessions: [], system: {} })
 const loading = ref(false)
 let timer = null
 
-const activeSessions = computed(() => (status.value.sessions || []).filter(s => ['prompting', 'connecting'].includes(s.status)))
 const waitingSessions = computed(() => (status.value.sessions || []).filter(s => s.waiting_for))
+// 等待输入优先展示；同一会话只出现在“等待输入”，不再重复出现在“运行中”。
+const activeSessions = computed(() => (status.value.sessions || []).filter(s => ['prompting', 'connecting'].includes(s.status) && !s.waiting_for))
 const errorSessions = computed(() => (status.value.sessions || []).filter(s => ['disconnected', 'error'].includes(s.status) && !s.waiting_for))
 
 // 会话操作模态框
@@ -262,7 +263,7 @@ onBeforeUnmount(() => {
 <style scoped>
 .codeg-dock {
   display: grid;
-  grid-template-columns: minmax(260px, 1.12fr) 1fr 1fr 1fr;
+  grid-template-columns: minmax(280px, 3fr) 2fr 2fr 2fr;
   gap: 12px;
   min-height: var(--codeg-bar-height, 240px);
   padding: 12px 16px;
@@ -300,31 +301,34 @@ onBeforeUnmount(() => {
 }
 .codeg-stat-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-  gap: 8px;
-  overflow: auto;
-  flex: 1;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  overflow: visible;
+  flex: 0 0 auto;
   align-content: start;
 }
 .res-card {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: flex-start; gap: 6px;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 8px 10px;
+  padding: 7px 8px;
   min-width: 0;
   width: 100%;
   box-sizing: border-box;
 }
 .res-icon {
-  width: 28px; height: 28px; border-radius: 6px;
+  width: 24px; height: 24px; border-radius: 6px;
   display: flex; align-items: center; justify-content: center;
   flex-shrink: 0;
+  margin-top: 1px;
 }
-.res-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
+.res-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
 .res-label { font-size: 10px; color: var(--muted); }
 .res-value { font-size: 12px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.res-value--wrap { white-space: normal; line-height: 1.2; word-break: break-word; overflow: visible; text-overflow: clip; }
 .res-sub { font-size: 10px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.res-sub--wrap { white-space: normal; line-height: 1.2; word-break: break-word; overflow: visible; text-overflow: clip; }
 .codeg-session-list {
   overflow-y: auto; min-height: 0;
   display: flex; flex-direction: column; gap: 6px;

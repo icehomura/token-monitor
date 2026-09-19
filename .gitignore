@@ -39,3 +39,9 @@ desktop.ini
 *.log
 .env
 .env.*
+
+# Stakpak session files
+.stakpak/
+
+# Playwright MCP
+.playwright-mcp/

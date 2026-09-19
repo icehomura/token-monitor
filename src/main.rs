@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod balance;
 mod codeg;
+mod probe;
 mod proxy;
 mod stats;
 
@@ -104,13 +106,16 @@ fn get_server_info() -> serde_json::Value {
 }
 
 fn proxy_port() -> u16 {
-    std::env::var("TOKEN_MONITOR_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8188)
+    // 端口只从 JSON 配置读取；缺省 8188
+    parse_saved_config(|v| {
+        v.get("port")
+            .and_then(|p| p.as_u64())
+            .filter(|p| *p > 0 && *p <= 65535)
+            .unwrap_or(8188) as u16
+    })
 }
 
-fn config_path() -> Option<std::path::PathBuf> {
+pub(crate) fn config_path() -> Option<std::path::PathBuf> {
     [
         std::env::current_exe().ok().map(|d| {
             d.parent()
@@ -440,13 +445,7 @@ fn apply_profile(p: &Profile) -> Result<(), String> {
 }
 
 fn read_api_key() -> String {
-    // 优先环境变量；其次工程根目录 token-monitor.json {"api_key": "..."}
-    if let Ok(k) = std::env::var("SUB2API_API_KEY") {
-        let k = k.trim().to_string();
-        if !k.is_empty() {
-            return k;
-        }
-    }
+    // 只认 JSON 配置：exe 同目录 / 工作目录的 token-monitor.json {"api_key": "..."}
     let candidates: Vec<std::path::PathBuf> = [
         std::env::current_dir().ok().map(|d| d.join("token-monitor.json")),
         std::env::current_exe().ok().map(|d| {
@@ -632,23 +631,14 @@ fn main() {
             // CodeG 配置独立加载；未配置时保持默认，不阻塞应用启动
             let codeg_config_v: serde_json::Value = parse_saved_config(serde_json::Value::clone);
             codeg::load_from_json(&codeg_config_v);
+            // 余额与探针配置同样独立加载，缺省即用默认值
+            balance::load_from_json(&codeg_config_v);
+            probe::load_from_json(&codeg_config_v);
             let mut cfg = proxy::ProxyConfig {
                 api_key: read_api_key(),
-                model_override: {
-                    let env_m = std::env::var("SUB2API_MODEL_OVERRIDE")
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
-                    if env_m.is_empty() { saved_model } else { env_m }
-                },
+                model_override: saved_model,
                 port: proxy_port(),
-                upstream_url: {
-                    let env_u = std::env::var("SUB2API_UPSTREAM")
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
-                    if env_u.is_empty() { saved_upstream } else { env_u }
-                },
+                upstream_url: saved_upstream,
                 max_concurrency: saved_max_conc,
             };
             // 如果存在已激活的配置文件，用其值覆盖扁平变量（旧变量已弃用）
@@ -670,7 +660,7 @@ fn main() {
             }
             if cfg.api_key.is_empty() {
                 eprintln!(
-                    "警告：未配置 SUB2API_API_KEY，也未找到 token-monitor.json，代理将返回配置错误"
+                    "警告：未配置 API Key，请在 token-monitor.json 的 api_key 字段填写，代理将返回配置错误"
                 );
             }
             // 同步初始化代理配置（前端 WebView 可能立即查询）
@@ -798,6 +788,12 @@ fn main() {
             save_profile,
             delete_profile,
             set_active_profile,
+            balance::get_balance_settings,
+            balance::set_balance_settings,
+            balance::get_balance,
+            probe::get_probe_settings,
+            probe::set_probe_settings,
+            probe::test_ai_connection,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

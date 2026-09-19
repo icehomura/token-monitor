@@ -1,6 +1,15 @@
 {
   "api_key": "",
   "model_override": "",
-  "upstream_url": "https://666sub2.i7a.top/v1/responses",
-  "port": 8188
+  "upstream_url": "https://your-upstream.example.com/v1/responses",
+  "port": 8188,
+  "balance": {
+    "enabled": false,
+    "currency": "CNY",
+    "interval_secs": 15
+  },
+  "probe": {
+    "enabled": true,
+    "interval_secs": 15
+  }
 }

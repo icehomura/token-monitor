@@ -18,12 +18,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
 
 const CODEG_DEFAULT_PORT: u16 = 3080;
 const DEFAULT_POLL_SECS: u64 = 5;
 const DEFAULT_INACTIVITY_TIMEOUT_SECS: u64 = 120;
+#[cfg(target_os = "windows")]
 const AGENT_PROCESS_NAMES: &[&str] = &[
     "claude.exe",
     "pi.exe",
@@ -35,6 +34,22 @@ const AGENT_PROCESS_NAMES: &[&str] = &[
     "cline.exe",
     "antigravity.exe",
     "openclaw.exe",
+    "freebuff.exe",
+];
+
+#[cfg(not(target_os = "windows"))]
+const AGENT_PROCESS_NAMES: &[&str] = &[
+    "claude",
+    "pi",
+    "opencode",
+    "codex",
+    "gemini",
+    "grok",
+    "hermes",
+    "cline",
+    "antigravity",
+    "openclaw",
+    "freebuff",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -576,7 +591,10 @@ pub async fn codeg_status() -> Result<CodegStatus, String> {
         waiting_input_count: waiting,
         active_session_name,
         sessions: summaries,
-        system: collect_system_stats(),
+        // 异步轮询每 5 秒调用一次，放阻塞线程避免 PowerShell/CLI 采样阻塞 runtime。
+        system: tokio::task::spawn_blocking(collect_system_stats)
+            .await
+            .unwrap_or_default(),
         recovery_events: events,
         auto_recovery_enabled: auto_recovery,
         inactivity_timeout_secs,
@@ -625,131 +643,189 @@ pub async fn session_action(
     }
 }
 
-// ──────────────── Windows 系统统计 ────────────────
+// ──────────────── 系统统计 ────────────────
 
-/// 统计 node / 编程智能体进程。使用 PowerShell 的原生 `Get-Process`，
-/// 不依赖 tasklist 的 `/FO` 参数，避免 MSYS 路径转换问题。
-fn count_processes(names: &[&str]) -> u64 {
-    let pattern = names
+/// 统计运行中进程数量。使用跨平台 sysinfo，
+/// 不启动 PowerShell 或第三方命令，避免控制台窗口闪动。
+fn count_processes(system: &sysinfo::System, names: &[&str]) -> u64 {
+    let target: Vec<std::ffi::OsString> = names.iter().map(std::ffi::OsString::from).collect();
+    target
         .iter()
-        .map(|n| n.trim_end_matches(".exe").to_owned())
-        .collect::<Vec<_>>()
-        .join(",");
-    let script = format!(
-        "Get-Process -ErrorAction SilentlyContinue | Where-Object {{ '{pattern}' -split ',' -contains $_.ProcessName.ToLowerInvariant() }} | Measure-Object | Select-Object -ExpandProperty Count"
-    );
-    run_powershell(&script)
-        .and_then(|s| s.trim().parse::<u64>().map_err(|e| e.to_string()))
-        .unwrap_or(0)
-}
-
-fn run_powershell(script: &str) -> Result<String, String> {
-    // 使用 CREATE_NO_WINDOW 标志彻底隐藏 PowerShell 窗口，
-    // -WindowStyle Hidden 在某些 Windows 版本上仍会短暂闪现。
-    #[cfg(target_os = "windows")]
-    const PS_FLAGS: u32 = windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
-    #[cfg(not(target_os = "windows"))]
-    const PS_FLAGS: u32 = 0;
-    let output = std::process::Command::new("powershell.exe")
-        .arg("-NoLogo")
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-Command")
-        .arg(script)
-        .creation_flags(PS_FLAGS)
-        .output()
-        .map_err(|e| format!("无法执行 powershell.exe：{e}"))?;
-    if !output.status.success() {
-        return Err(format!("powershell.exe 退出状态：{:?}", output.status.code()));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .map(|name| system.processes_by_exact_name(name.as_os_str()).count() as u64)
+        .sum()
 }
 
 fn collect_resource_stats() -> SystemStats {
-    // 一行 PowerShell 返回：cpu, usedMemBytes, totalMemBytes, cUsedBytes, cTotalBytes
-    // 避免外层 shell 展开 `$`（Rust Command 不会展开，但保持脚本简单可靠）。
-    // 注意：不用 PowerShell -f 格式化操作符，中文 locale 下大数字会加千位分隔符
-    // （如 41,869,472），导致 Rust f64 解析失败返回 0。改用字符串插值。
-    let script = "$os=Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue; $cpu=(Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue|Measure-Object -Property LoadPercentage -Average).Average; $totalKB=[double]$os.TotalVisibleMemorySize; $freeKB=[double]$os.FreePhysicalMemory; $usedKB=$totalKB-$freeKB; $drive=Get-PSDrive -Name C -ErrorAction SilentlyContinue; $cUsed=[double]$drive.Used; $cTotal=[double]($drive.Used+$drive.Free); Write-Output \"$cpu $usedKB $totalKB $cUsed $cTotal\"";
-    let out = match run_powershell(script) {
-        Ok(out) => out,
-        Err(_) => return SystemStats::default(),
+    let mut system = sysinfo::System::new_with_specifics(
+        sysinfo::RefreshKind::nothing()
+            .with_cpu(sysinfo::CpuRefreshKind::nothing().with_cpu_usage())
+            .with_memory(sysinfo::MemoryRefreshKind::everything()),
+    );
+    // CPU 占用率基于两次采样；第一次填充基线，sleep 后再次刷新。
+    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+    system.refresh_cpu_usage();
+
+    let cpu_percent = system.global_cpu_usage().max(0.0) as f64;
+    let mem_total = system.total_memory();
+    let mem_used = system.used_memory();
+    let mem_percent = if mem_total == 0 {
+        0.0
+    } else {
+        (mem_used as f64 / mem_total as f64 * 1000.0).round() / 10.0
     };
-    let parts: Vec<f64> = out
-        .split_whitespace()
-        .filter_map(|s| s.parse::<f64>().ok())
-        .collect();
-    if parts.len() < 5 {
-        return SystemStats::default();
-    }
-    let cpu = parts[0];
-    let mem_used = parts[1];
-    let mem_total = parts[2];
-    let c_used = parts[3];
-    let c_total = parts[4];
+
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    #[cfg(target_os = "windows")]
+    let root_disk = disks
+        .list()
+        .iter()
+        .find(|d| d.mount_point().starts_with("C:\\") || d.mount_point() == std::path::Path::new("C:"));
+    #[cfg(not(target_os = "windows"))]
+    let root_disk = disks
+        .list()
+        .iter()
+        .find(|d| d.mount_point() == std::path::Path::new("/"));
+    let c_total = root_disk.map(|d| d.total_space()).unwrap_or(0);
+    let c_free = root_disk.map(|d| d.available_space()).unwrap_or(0);
+    let c_used = c_total.saturating_sub(c_free);
+    let c_percent = if c_total == 0 {
+        0.0
+    } else {
+        (c_used as f64 / c_total as f64 * 1000.0).round() / 10.0
+    };
+
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    #[cfg(target_os = "windows")]
+    let node_processes = count_processes(&system, &["node.exe", "nodejs.exe"]);
+    #[cfg(not(target_os = "windows"))]
+    let node_processes = count_processes(&system, &["node"]);
+    let agent_processes = count_processes(&system, AGENT_PROCESS_NAMES);
     let gpu_hint = gpu_usage_gb();
+
     SystemStats {
-        cpu_percent: cpu.round(),
-        // mem_used / mem_total 现在是 KB（不再是 bytes），除以 1024² 转 GB
-        memory_used_gb: (mem_used / 1024.0 / 1024.0 * 10.0).round() / 10.0,
-        memory_total_gb: (mem_total / 1024.0 / 1024.0 * 10.0).round() / 10.0,
-        memory_percent: if mem_total > 0.0 {
-            (mem_used / mem_total * 1000.0).round() / 10.0
-        } else {
-            0.0
-        },
+        cpu_percent,
+        memory_used_gb: (mem_used as f64 / 1024.0 / 1024.0 / 1024.0 * 10.0).round() / 10.0,
+        memory_total_gb: (mem_total as f64 / 1024.0 / 1024.0 / 1024.0 * 10.0).round() / 10.0,
+        memory_percent: mem_percent,
         gpu_used_gb: gpu_hint.0,
         gpu_total_gb: gpu_hint.1,
         gpu_percent: gpu_hint.2,
-        // c_used / c_total 现在是 bytes（来自 PSDrive），除以 1024³ 转 GB
-        c_drive_used_gb: (c_used / 1024.0 / 1024.0 / 1024.0 * 10.0).round() / 10.0,
-        c_drive_total_gb: (c_total / 1024.0 / 1024.0 / 1024.0 * 10.0).round() / 10.0,
-        c_drive_free_gb: ((c_total - c_used) / 1024.0 / 1024.0 / 1024.0 * 10.0).round() / 10.0,
-        c_drive_percent: if c_total > 0.0 {
-            (c_used / c_total * 1000.0).round() / 10.0
-        } else {
-            0.0
-        },
-        node_processes: count_processes(&["node.exe", "nodejs.exe"]),
-        agent_processes: count_processes(AGENT_PROCESS_NAMES),
+        c_drive_used_gb: (c_used as f64 / 1024.0 / 1024.0 / 1024.0 * 10.0).round() / 10.0,
+        c_drive_total_gb: (c_total as f64 / 1024.0 / 1024.0 / 1024.0 * 10.0).round() / 10.0,
+        c_drive_free_gb: (c_free as f64 / 1024.0 / 1024.0 / 1024.0 * 10.0).round() / 10.0,
+        c_drive_percent: c_percent,
+        node_processes,
+        agent_processes,
     }
 }
 
-/// Windows GPU 专用内存采样。优先 nvidia-smi，其余厂商暂返回未可知状态。
+/// Windows GPU 专用内存采样。通过 NVML 动态加载读取，
+/// 不启动 nvidia-smi 子进程，也不要求安装额外 CLI。
+#[cfg(target_os = "windows")]
 fn gpu_usage_gb() -> (Option<f64>, Option<f64>, Option<f64>) {
-    for tool in ["nvidia-smi", "nvidia-smi.exe"] {
-        let out = std::process::Command::new(tool)
-            .args([
-                "--query-gpu=memory.used,memory.total,utilization.gpu",
-                "--format=csv,noheader,nounits",
-            ])
-            .output();
-        if let Ok(o) = out {
-            if o.status.success() {
-                let line = String::from_utf8_lossy(&o.stdout);
-                if let Some(line) = line.lines().next() {
-                    let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-                    if parts.len() >= 3 {
-                        let used = parts[0].parse::<f64>().unwrap_or(0.0);
-                        let total = parts[1].parse::<f64>().unwrap_or(1.0);
-                        let percent = parts[2].parse::<f64>().unwrap_or(0.0);
-                        return (Some(used / 1024.0), Some(total / 1024.0), Some(percent));
+    const NVML_SUCCESS: i32 = 0;
+
+    #[derive(Clone, Copy, Default)]
+    #[repr(C)]
+    struct NvmlMemory {
+        total: u64,
+        free: u64,
+        used: u64,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    #[repr(C)]
+    struct NvmlUtilization {
+        gpu: u32,
+        memory: u32,
+    }
+
+    let library = match unsafe { libloading::Library::new("nvml.dll") } {
+        Ok(lib) => lib,
+        Err(_) => return (None, None, None),
+    };
+
+    type NvmlInit = unsafe extern "C" fn() -> i32;
+    type NvmlShutdown = unsafe extern "C" fn() -> i32;
+    type NvmlDeviceGetCount = unsafe extern "C" fn(*mut u32) -> i32;
+    type NvmlDeviceGetHandleByIndex = unsafe extern "C" fn(u32, *mut usize) -> i32;
+    type NvmlDeviceGetMemoryInfo = unsafe extern "C" fn(usize, *mut NvmlMemory) -> i32;
+    type NvmlDeviceGetUtilizationRates = unsafe extern "C" fn(usize, *mut NvmlUtilization) -> i32;
+
+    let init: libloading::Symbol<NvmlInit> = match unsafe { library.get(b"nvmlInit_v2\0") } {
+        Ok(sym) => sym,
+        Err(_) => return (None, None, None),
+    };
+    let shutdown: libloading::Symbol<NvmlShutdown> = match unsafe { library.get(b"nvmlShutdown\0") } {
+        Ok(sym) => sym,
+        Err(_) => return (None, None, None),
+    };
+    let count_fn: libloading::Symbol<NvmlDeviceGetCount> =
+        match unsafe { library.get(b"nvmlDeviceGetCount_v2\0") } {
+            Ok(sym) => sym,
+            Err(_) => return (None, None, None),
+        };
+    let handle_fn: libloading::Symbol<NvmlDeviceGetHandleByIndex> = match unsafe {
+        library.get(b"nvmlDeviceGetHandleByIndex_v2\0")
+    } {
+        Ok(sym) => sym,
+        Err(_) => return (None, None, None),
+    };
+    let memory_fn: libloading::Symbol<NvmlDeviceGetMemoryInfo> =
+        match unsafe { library.get(b"nvmlDeviceGetMemoryInfo\0") } {
+            Ok(sym) => sym,
+            Err(_) => return (None, None, None),
+        };
+    let util_fn: libloading::Symbol<NvmlDeviceGetUtilizationRates> =
+        match unsafe { library.get(b"nvmlDeviceGetUtilizationRates\0") } {
+            Ok(sym) => sym,
+            Err(_) => return (None, None, None),
+        };
+
+    let mut result = (None, None, None);
+    unsafe {
+        match init() {
+            NVML_SUCCESS => {
+                let mut dev_count = 0u32;
+                if count_fn(&mut dev_count) == NVML_SUCCESS && dev_count > 0 {
+                    for i in 0..dev_count {
+                        let mut handle = 0usize;
+                        if handle_fn(i, &mut handle) != NVML_SUCCESS {
+                            continue;
+                        }
+                        let mut mem = NvmlMemory::default();
+                        let mut util = NvmlUtilization::default();
+                        if memory_fn(handle, &mut mem) == NVML_SUCCESS {
+                            // NVML 返回的是字节；系统统计字段约定为 GB。
+                            result = (
+                                Some(mem.used as f64 / 1024.0 / 1024.0 / 1024.0),
+                                Some(mem.total as f64 / 1024.0 / 1024.0 / 1024.0),
+                                None,
+                            );
+                            if util_fn(handle, &mut util) == NVML_SUCCESS {
+                                result.2 = Some(util.gpu as f64);
+                            }
+                            break;
+                        }
                     }
                 }
+                shutdown();
             }
+            _ => {}
         }
     }
+    result
+}
+
+#[cfg(not(target_os = "windows"))]
+fn gpu_usage_gb() -> (Option<f64>, Option<f64>, Option<f64>) {
     (None, None, None)
 }
 
-/// 返回供底部状态行使用的系统统计。当前 Windows 使用 PowerShell；
-/// 非 Windows 环境返回全空值，不安装额外依赖。
+/// 返回供底部状态行使用的系统统计。使用跨平台 sysinfo + NVML，
+/// 不启动 PowerShell / nvidia-smi 子进程。
 pub fn collect_system_stats() -> SystemStats {
-    if cfg!(target_os = "windows") {
-        collect_resource_stats()
-    } else {
-        SystemStats::default()
-    }
+    collect_resource_stats()
 }
 #[cfg(test)]
 mod tests {
