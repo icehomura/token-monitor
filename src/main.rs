@@ -286,6 +286,9 @@ async fn set_port(port: u16) -> Result<serde_json::Value, String> {
     }
     save_port(port)?;
     proxy::restart_server(port).await?;
+    if let Some(handle) = proxy::app_handle() {
+        let _ = handle.emit("server-info-changed", ());
+    }
     Ok(serde_json::json!({"port": port, "endpoint": format!("http://127.0.0.1:{}/v1", port)}))
 }
 
