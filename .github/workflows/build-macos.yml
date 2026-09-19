@@ -31,8 +31,7 @@ jobs:
         run: npm ci
 
       - name: Build Tauri app
-        working-directory: frontend
-        run: npx tauri build --target aarch64-apple-darwin
+        run: ./frontend/node_modules/.bin/tauri build --target aarch64-apple-darwin
 
       - name: Upload .app bundle
         uses: actions/upload-artifact@v4
