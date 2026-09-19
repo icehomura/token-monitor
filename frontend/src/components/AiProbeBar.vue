@@ -55,7 +55,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { useTauri } from '../composables/useTauri'
 
 const { invoke } = useTauri()
@@ -83,6 +83,29 @@ const MAX_CAPACITY = 60 // 历史队列最大容量，窗口变窄时不缩减�
 
 const stripWidth = ref(0)   // strip 容器的实际像素宽度
 let resizeObs = null        // ResizeObserver 实例
+
+// 整行由 v-if 控制，mount 时元素尚未渲染（stripRef 为 null）。
+// 因此必须等 visible 变 true、DOM 渲染完成后再挂 ResizeObserver，
+// 否则宽度永远是 0，色块一个都不会显示。
+let stripReady = false
+async function setupStrip() {
+  if (stripReady) return
+  await nextTick()
+  if (!stripRef.value) return
+  stripReady = true
+  const measure = () => {
+    if (stripRef.value) stripWidth.value = Math.floor(stripRef.value.getBoundingClientRect().width)
+  }
+  measure()
+  resizeObs = new ResizeObserver((entries) => {
+    for (const entry of entries) {
+      stripWidth.value = Math.floor(entry.contentRect.width)
+    }
+  })
+  resizeObs.observe(stripRef.value)
+}
+
+watch(visible, (v) => { if (v) setupStrip() }, { immediate: true })
 
 // 根据可用宽度计算当前能显示多少个色块（上限 = MAX_CAPACITY）
 const visibleCount = computed(() => {
@@ -278,16 +301,6 @@ async function tick() {
 // 探测条宽度由剩余空间动态决定，窗口变宽时多显示几个旧色块（数据不丢失），
 // 变窄时少显示几个（数据还在队列里）。上限固定 MAX_CAPACITY，不会随窗口缩放而缩减数据。
 onMounted(async () => {
-  // 启动 ResizeObserver，实时测量 strip 容器宽度
-  if (stripRef.value) {
-    resizeObs = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        stripWidth.value = Math.floor(entry.contentRect.width)
-      }
-    })
-    resizeObs.observe(stripRef.value)
-  }
-
   const s = await readProbeSettings()
   // 未开启探针：整行不渲染
   if (!s || s.enabled === false) {
@@ -409,10 +422,12 @@ onBeforeUnmount(() => {
 .probe-strip {
   display: flex;
   align-items: stretch;
+  justify-content: flex-end;
   gap: 1px;
-  margin-left: auto;
-  flex: 0 0 auto;
-  min-width: 120px;
+  /* 占满左侧统计之后的全部剩余空间：宽度由容器决定而非内容，
+     避免「宽度为 0 → 色块为 0 → 宽度仍为 0」的自举死锁 */
+  flex: 1 1 auto;
+  min-width: 0;
   height: 14px;
 }
 

@@ -62,13 +62,12 @@ function renderChart() {
   if (!chart) return
   const tc = themeColors.value
 
-  // 每条线独立缩放至自身峰值，RPM 跟随较高量级
+  // 输入词元与 RPM 共用左轴，量级相差极大，各自缩放至峰值以便同屏观察趋势；
+  // 输出词元独占右轴，直接用原始值，刻度即真实值，无需缩放。
   const maxRpm = Math.max(...props.rpms, 1)
   const maxInput = Math.max(...props.inputTpms, 1)
-  const maxOutput = Math.max(...props.tpms, 1)
   const peak = 100000
   const inputScale = peak / maxInput
-  const outputScale = peak / maxOutput
   const rpmScale = peak / maxRpm  // RPM 也独立缩放至自身峰值
 
   chart.setOption(
@@ -90,7 +89,8 @@ function renderChart() {
               val = Math.round(p.value / inputScale)
               unit = '词元/分'
             } else {
-              val = Math.round(p.value / outputScale)
+              // 输出词元独占右轴，值为原始值，不做还原
+              val = Math.round(p.value)
               unit = '词元/分'
             }
             const display = fmtTokens(val, props.convertUnits)
