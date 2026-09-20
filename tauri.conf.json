@@ -20,7 +20,6 @@
         "visible": true,
         "resizable": true,
         "decorations": false,
-        "titleBarStyle": "overlay",
         "backgroundColor": "#0f1420"
       }
     ],
