@@ -62,14 +62,9 @@ function renderChart() {
   if (!chart) return
   const tc = themeColors.value
 
-  // 输入词元与 RPM 共用左轴，量级相差极大，各自缩放至峰值以便同屏观察趋势；
-  // 输出词元独占右轴，直接用原始值，刻度即真实值，无需缩放。
-  const maxRpm = Math.max(...props.rpms, 1)
-  const maxInput = Math.max(...props.inputTpms, 1)
-  const peak = 100000
-  const inputScale = peak / maxInput
-  const rpmScale = peak / maxRpm  // RPM 也独立缩放至自身峰值
-
+  // 三条线量级相差极大（RPM 个位数 / 输出词元千级 / 输入词元百万级），
+  // 若共用坐标轴，小的会被压成一条直线；若归一化到同一峰值，刻度就成了假数。
+  // 因此每条线各占一条真实坐标轴，刻度 = tooltip = 原始值，不做任何缩放。
   chart.setOption(
     {
       backgroundColor: 'transparent',
@@ -81,19 +76,9 @@ function renderChart() {
           let s = `<div style="font-size:12px;margin-bottom:4px">${params[0].axisValue}</div>`
           for (const p of params) {
             const color = p.color
-            let val, unit
-            if (p.seriesName === 'RPM') {
-              val = Math.round(p.value / rpmScale)
-              unit = '次/分'
-            } else if (p.seriesName === '输入词元') {
-              val = Math.round(p.value / inputScale)
-              unit = '词元/分'
-            } else {
-              // 输出词元独占右轴，值为原始值，不做还原
-              val = Math.round(p.value)
-              unit = '词元/分'
-            }
-            const display = fmtTokens(val, props.convertUnits)
+            const unit = p.seriesName === 'RPM' ? '次/分' : '词元/分'
+            // 数据未缩放，直接展示原始值
+            const display = fmtTokens(Math.round(p.value) || 0, props.convertUnits)
             s += `<div style="display:flex;align-items:center;gap:6px;margin:2px 0">`
             s += `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${color}"></span>`
             s += `<span>${p.seriesName}：</span><b>${display}</b> <span style="color:#999">${unit}</span></div>`
@@ -106,18 +91,29 @@ function renderChart() {
         top: 0,
         textStyle: { color: tc.label, fontSize: 12 },
       },
-      grid: { left: 60, right: 70, top: 36, bottom: 30 },
+      // 右侧两条轴需要额外留白，故 right 比 left 大
+      grid: { left: 56, right: 132, top: 36, bottom: 30 },
       xAxis: { type: 'category', data: props.labels, ...axis(), boundaryGap: true },
       yAxis: [
         {
-          type: 'value', name: '输入词元 / RPM',
+          // 0：RPM，左侧
+          type: 'value', name: 'RPM', position: 'left',
           nameTextStyle: { color: tc.label, align: 'left' },
           ...axis(),
           axisLabel: { ...axis().axisLabel, formatter: v => fmtTokens(v, props.convertUnits) },
           splitLine: { lineStyle: { color: tc.split } },
         },
         {
-          type: 'value', name: '输出词元',
+          // 1：输入词元，右侧靠内
+          type: 'value', name: '输入词元', position: 'right', offset: 0,
+          nameTextStyle: { color: tc.label, align: 'right' },
+          ...axis(),
+          axisLabel: { ...axis().axisLabel, formatter: v => fmtTokens(v, props.convertUnits) },
+          splitLine: { show: false },
+        },
+        {
+          // 2：输出词元，右侧再向外偏移一条轴位
+          type: 'value', name: '输出词元', position: 'right', offset: 62,
           nameTextStyle: { color: tc.label, align: 'right' },
           ...axis(),
           axisLabel: { ...axis().axisLabel, formatter: v => fmtTokens(v, props.convertUnits) },
@@ -126,20 +122,18 @@ function renderChart() {
       ],
       series: [
         {
-          name: 'RPM', type: 'bar', yAxisIndex: 0,
-          data: props.rpms.map(v => v * rpmScale),
+          name: 'RPM', type: 'bar', yAxisIndex: 0, data: props.rpms,
           itemStyle: { color: 'rgba(124, 133, 152, 0.45)', borderRadius: [3, 3, 0, 0] },
           barMaxWidth: 26,
         },
         {
-          name: '输入词元', type: 'line', yAxisIndex: 0,
-          data: props.inputTpms.map(v => v * inputScale),
+          name: '输入词元', type: 'line', yAxisIndex: 1, data: props.inputTpms,
           smooth: true, symbol: 'circle', symbolSize: 4,
           lineStyle: { color: tc.blue, width: 2 },
           itemStyle: { color: tc.blue },
         },
         {
-          name: '输出词元', type: 'line', yAxisIndex: 1, data: props.tpms,
+          name: '输出词元', type: 'line', yAxisIndex: 2, data: props.tpms,
           smooth: true, symbol: 'circle', symbolSize: 5,
           lineStyle: { color: tc.green, width: 2 },
           itemStyle: { color: tc.green },
