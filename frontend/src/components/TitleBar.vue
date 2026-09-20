@@ -1,5 +1,5 @@
 <template>
-  <div class="titlebar" ref="titlebarRef" @mousedown="tryDrag" @dblclick="onDblClick">
+  <div class="titlebar" :class="{ 'titlebar--mac': isMac }" ref="titlebarRef" @mousedown="tryDrag" @dblclick="onDblClick">
     <div class="titlebar-brand">
       <span class="dot"></span>
       <strong>Token Monitor</strong>
@@ -27,12 +27,12 @@
           <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1z" />
         </svg>
       </IconButton>
-      <IconButton title="最小化" @click="win?.minimize()">
+      <IconButton title="最小化" @click="win?.minimize()" v-if="!isMac">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
           <path d="M5 12h14" />
         </svg>
       </IconButton>
-      <IconButton title="最大化" @click="toggleMaximize">
+      <IconButton title="最大化" @click="toggleMaximize" v-if="!isMac">
         <svg v-show="!isMaximized" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round">
           <rect x="5" y="5" width="14" height="14" rx="1.5" />
         </svg>
@@ -41,7 +41,7 @@
           <path d="M5 16V6.5A1.5 1.5 0 0 1 6.5 5H16" />
         </svg>
       </IconButton>
-      <IconButton title="隐藏到托盘" class="ibtn--close" @click="win?.close()">
+      <IconButton title="隐藏到托盘" class="ibtn--close" @click="win?.close()" v-if="!isMac">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
           <path d="M18 6 6 18M6 6l12 12" />
         </svg>
@@ -63,6 +63,7 @@ const win = getCurrentWindow()
 const pinned = ref(false)
 const isMaximized = ref(false)
 const titlebarRef = ref(null)
+const isMac = /mac|darwin/i.test(navigator.userAgent)
 
 // ---- DeepSeek 余额（组件自持状态，不依赖父组件传参） ----
 const balanceVisible = ref(false)
@@ -214,6 +215,8 @@ onBeforeUnmount(() => {
   user-select: none;
   flex-shrink: 0;
 }
+/* macOS：原生红绿灯占据左侧 ~70px，标题栏内容自动右移 */
+.titlebar--mac { padding-left: 80px; }
 .titlebar-brand { display: flex; align-items: center; gap: 10px; }
 .titlebar-brand strong { font-size: 14px; font-weight: 600; color: var(--text); }
 .concurrency-badge {

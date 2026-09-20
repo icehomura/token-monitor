@@ -719,6 +719,12 @@ fn main() {
             // 同步初始化代理配置（前端 WebView 可能立即查询）
             proxy::init(app.handle().clone(), cfg.clone());
 
+            // macOS：启用原生标题栏装饰（红绿灯），Windows/Linux 保持 decorations: false
+            #[cfg(target_os = "macos")]
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.set_decorations(true);
+            }
+
             // 立即启动代理服务（不等 DB 初始化）
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = proxy::restart_server(cfg.port).await {
