@@ -157,6 +157,46 @@ async fn probe_responses(upstream: &str, api_key: &str, model: &str) -> Result<u
     Ok(resp.status().as_u16())
 }
 
+/// 向 Chat Completions 上游发送最小请求（`{ model, messages: [...] }`），只关心状态码。
+async fn probe_chat_completions(upstream: &str, api_key: &str, model: &str) -> Result<u16, String> {
+    let client = reqwest::Client::builder()
+        .timeout(PROBE_TIMEOUT)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(upstream)
+        .bearer_auth(api_key)
+        .json(&json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(resp.status().as_u16())
+}
+
+/// 向 Anthropic Messages 上游发送最小请求，只关心状态码。
+async fn probe_anthropic(upstream: &str, api_key: &str, model: &str) -> Result<u16, String> {
+    let client = reqwest::Client::builder()
+        .timeout(PROBE_TIMEOUT)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(upstream)
+        .bearer_auth(api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": model,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(resp.status().as_u16())
+}
+
 // ──────────────── Tauri 命令 ────────────────
 
 /// 读取探针设置（供设置面板回显）
@@ -205,7 +245,12 @@ pub async fn test_ai_connection() -> Result<Value, String> {
     };
 
     let start = Instant::now();
-    let result = probe_responses(&upstream, &proxy_cfg.api_key, &proxy_cfg.model_override).await;
+    let upstream_format = crate::proxy::cfg().upstream_format;
+    let result = match upstream_format {
+        crate::proxy::UpstreamFormat::ChatCompletions => probe_chat_completions(&upstream, &proxy_cfg.api_key, &proxy_cfg.model_override).await,
+        crate::proxy::UpstreamFormat::Anthropic => probe_anthropic(&upstream, &proxy_cfg.api_key, &proxy_cfg.model_override).await,
+        crate::proxy::UpstreamFormat::Responses => probe_responses(&upstream, &proxy_cfg.api_key, &proxy_cfg.model_override).await,
+    };
     let latency_ms = start.elapsed().as_millis() as u64;
 
     Ok(match result {

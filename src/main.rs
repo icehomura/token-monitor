@@ -8,6 +8,7 @@ mod stats;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use crate::proxy::UpstreamFormat;
 use tauri::{
     Emitter, Listener, Manager,
     menu::{Menu, MenuItem},
@@ -25,6 +26,7 @@ struct Profile {
     api_key: String,
     model_override: String,
     max_concurrency: usize,
+    upstream_format: String,
 }
 
 impl Default for Profile {
@@ -36,6 +38,7 @@ impl Default for Profile {
             api_key: String::new(),
             model_override: String::new(),
             max_concurrency: 20,
+            upstream_format: "responses".into(),
         }
     }
 }
@@ -186,6 +189,7 @@ fn set_model_config(api_key: String, model_override: String) -> Result<serde_jso
         Some(model_trimmed.clone()),
         None,
         None,
+        None,
     );
 
     println!("saved model config to {}", path.display());
@@ -249,6 +253,7 @@ struct SettingsInfo {
     upstream_url: String,
     max_concurrency: usize,
     active_profile_id: String,
+    upstream_format: String,
 }
 
 #[tauri::command]
@@ -262,6 +267,7 @@ fn get_settings() -> SettingsInfo {
         upstream_url: proxy::upstream_url(),
         max_concurrency: c.max_concurrency,
         active_profile_id: active_id,
+        upstream_format: c.upstream_format.as_str().to_string(),
     }
 }
 
@@ -281,7 +287,7 @@ fn set_upstream(url: String) -> Result<serde_json::Value, String> {
     std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap())
         .map_err(|e| format!("写入配置失败：{e}"))?;
 
-    proxy::update_runtime(None, None, Some(url.clone()), None);
+    proxy::update_runtime(None, None, Some(url.clone()), None, None);
     println!("saved upstream url to {}", path.display());
     if let Some(handle) = proxy::app_handle() {
         let _ = handle.emit("server-info-changed", ());
@@ -449,6 +455,7 @@ fn apply_profile(p: &Profile) -> Result<(), String> {
         Some(p.model_override.clone()),
         Some(p.upstream_url.clone()),
         Some(p.max_concurrency),
+        Some(UpstreamFormat::from_str(&p.upstream_format)),
     );
     println!("[main] 已切换到配置文件：{}", p.name);
     // 通知前端刷新服务端信息（toolbar 地址栏、模型名等）
@@ -693,6 +700,7 @@ fn main() {
                 port: proxy_port(),
                 upstream_url: saved_upstream,
                 max_concurrency: saved_max_conc,
+                upstream_format: UpstreamFormat::Responses,
             };
             // 如果存在已激活的配置文件，用其值覆盖扁平变量（旧变量已弃用）
             let (profiles, active_id) = read_profiles_from_config();
@@ -709,6 +717,9 @@ fn main() {
                         cfg.upstream_url = active.upstream_url.clone();
                     }
                     cfg.max_concurrency = active.max_concurrency;
+                    if !active.upstream_format.is_empty() {
+                        cfg.upstream_format = UpstreamFormat::from_str(&active.upstream_format);
+                    }
                 }
             }
             if cfg.api_key.is_empty() {

@@ -3,6 +3,7 @@
   "model_override": "",
   "upstream_url": "https://your-upstream.example.com/v1/responses",
   "port": 8188,
+  "upstream_format": "responses",
   "balance": {
     "enabled": false,
     "currency": "CNY",

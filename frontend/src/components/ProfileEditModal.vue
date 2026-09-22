@@ -27,6 +27,14 @@
               <BaseInput v-model="form.api_key" type="password" placeholder="sk-..." />
             </div>
             <div class="form-row">
+              <label class="form-label">上游格式</label>
+              <select v-model="form.upstream_format" class="select">
+                <option value="responses">Responses API</option>
+                <option value="chat_completions">Chat Completions</option>
+                <option value="anthropic">Anthropic Messages</option>
+              </select>
+            </div>
+            <div class="form-row">
               <label class="form-label">最大并发数</label>
               <BaseInput v-model.number="form.max_concurrency" type="number" :min="1" :max="999" spinner />
             </div>
@@ -62,6 +70,7 @@ const form = ref({
   id: '',
   name: '',
   upstream_url: '',
+  upstream_format: 'responses',
   api_key: '',
   model_override: '',
   max_concurrency: 20,
@@ -116,6 +125,14 @@ function handleSave() {
 .form-row { display: flex; align-items: center; gap: 10px; }
 .form-label { font-size: 12px; color: var(--muted); width: 80px; flex-shrink: 0; text-align: right; }
 .form-row :deep(.input-wrap) { flex: 1; }
+.select {
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 7px 10px; font-size: 13px; outline: none;
+  width: 100%; min-width: 0; flex: 1;
+  cursor: pointer;
+}
+.select:focus { border-color: var(--blue); }
 .modal-footer {
   display: flex;
   align-items: center;

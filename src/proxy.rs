@@ -14,6 +14,38 @@ use tauri::Emitter;
 
 const MAX_RETRIES: usize = 3;
 
+/// 上游 API 格式：决定代理如何转换请求和响应
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamFormat {
+    /// OpenAI Responses API（默认）
+    Responses,
+    /// OpenAI Chat Completions
+    ChatCompletions,
+    /// Anthropic Messages
+    Anthropic,
+}
+
+impl Default for UpstreamFormat {
+    fn default() -> Self { Self::Responses }
+}
+
+impl UpstreamFormat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Responses => "responses",
+            Self::ChatCompletions => "chat_completions",
+            Self::Anthropic => "anthropic",
+        }
+    }
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "chat_completions" => Self::ChatCompletions,
+            "anthropic" => Self::Anthropic,
+            _ => Self::Responses,
+        }
+    }
+}
+
 /// 单次请求体上限。axum 对 Json 提取器默认只放行 2MB，长上下文请求会被本地
 /// 直接 413 拦下（报错来自本进程，与上游无关）。这里放宽到 1GiB。
 const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024 * 1024;
@@ -34,6 +66,8 @@ pub struct ProxyConfig {
     pub upstream_url: String,
     /// 最大并发数（可通过配置文件修改）
     pub max_concurrency: usize,
+    /// 上游 API 格式：responses / chat_completions / anthropic
+    pub upstream_format: UpstreamFormat,
 }
 
 static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
@@ -71,6 +105,7 @@ pub fn update_runtime(
     model_override: Option<String>,
     upstream_url: Option<String>,
     max_concurrency: Option<usize>,
+    upstream_format: Option<UpstreamFormat>,
 ) {
     let mut c = CONFIG.write().unwrap_or_else(|e| e.into_inner());
     if let Some(c) = c.as_mut() {
@@ -85,6 +120,9 @@ pub fn update_runtime(
         }
         if let Some(mc) = max_concurrency {
             c.max_concurrency = mc;
+        }
+        if let Some(f) = upstream_format {
+            c.upstream_format = f;
         }
     }
 }
@@ -430,6 +468,494 @@ fn anthropic_to_responses_payload(body: &Value, stream: bool) -> Value {
     }
     if let Some(mt) = body.get("max_tokens") {
         payload["max_output_tokens"] = mt.clone();
+    }
+    if !cfg().model_override.is_empty() {
+        payload["model"] = json!(cfg().model_override);
+    }
+    payload
+}
+
+// ---------- 参数转换：Responses API -> Chat Completions ----------
+
+/// Responses API input items -> Chat messages 数组
+fn responses_items_to_chat_messages(items: &[Value]) -> Vec<Value> {
+    let mut messages = Vec::new();
+    for item in items {
+        let ty = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match ty {
+            "message" => {
+                let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                let content = item.get("content");
+                let text = match content {
+                    Some(Value::Array(parts)) => parts
+                        .iter()
+                        .filter_map(|p| {
+                            let pty = p.get("type").and_then(|t| t.as_str())?;
+                            matches!(pty, "input_text" | "output_text" | "text")
+                                .then(|| p.get("text").and_then(|t| t.as_str()).unwrap_or(""))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
+                    Some(Value::String(s)) => s.clone(),
+                    _ => continue,
+                };
+                messages.push(json!({"role": role, "content": text}));
+            }
+            "function_call" => {
+                messages.push(json!({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": item.get("call_id").and_then(|c| c.as_str()).unwrap_or(""),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                            "arguments": item.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}"),
+                        },
+                    }],
+                }));
+            }
+            "function_call_output" => {
+                let output = item.get("output").and_then(|o| o.as_str()).unwrap_or("");
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id").and_then(|c| c.as_str()).unwrap_or(""),
+                    "content": output,
+                }));
+            }
+            _ => {}
+        }
+    }
+    messages
+}
+
+/// Responses tools -> Chat Completions tools
+fn responses_tools_to_chat(tools: Option<&Value>) -> Option<Value> {
+    let arr = tools?.as_array()?;
+    let out: Vec<Value> = arr
+        .iter()
+        .filter_map(|t| {
+            if t.get("type")?.as_str()? == "function" {
+                return Some(json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.get("name")?,
+                        "description": t.get("description"),
+                        "parameters": t.get("parameters"),
+                    },
+                }));
+            }
+            None
+        })
+        .filter(|t| t.pointer("/function/name").and_then(|n| n.as_str()).is_some())
+        .collect();
+    if out.is_empty() { None } else { Some(Value::Array(out)) }
+}
+
+/// Responses API -> Chat Completions payload
+fn responses_to_chat_payload(body: &Value, stream: bool) -> Value {
+    let messages = match body.get("input").and_then(|i| i.as_array()) {
+        Some(items) => responses_items_to_chat_messages(items),
+        None => vec![],
+    };
+    let mut payload = json!({
+        "messages": messages,
+        "stream": stream,
+    });
+    if let Some(m) = body.get("model") {
+        payload["model"] = m.clone();
+    }
+    if let Some(t) = responses_tools_to_chat(body.get("tools")) {
+        payload["tools"] = t;
+    }
+    for (from, to) in [("temperature", "temperature"), ("top_p", "top_p")] {
+        if let Some(v) = body.get(from) {
+            payload[to] = v.clone();
+        }
+    }
+    if let Some(mt) = body.get("max_output_tokens") {
+        payload["max_tokens"] = mt.clone();
+    }
+    if !cfg().model_override.is_empty() {
+        payload["model"] = json!(cfg().model_override);
+    }
+    payload
+}
+
+// ---------- 参数转换：Chat Completions -> Anthropic Messages ----------
+
+/// Chat tools -> Anthropic tools
+fn chat_tools_to_anthropic(tools: Option<&Value>) -> Option<Value> {
+    let arr = tools?.as_array()?;
+    let out: Vec<Value> = arr
+        .iter()
+        .filter_map(|t| {
+            let f = t.get("function")?;
+            Some(json!({
+                "name": f.get("name")?,
+                "description": f.get("description"),
+                "input_schema": f.get("parameters"),
+            }))
+        })
+        .filter(|t| t.get("name").and_then(|n| n.as_str()).is_some())
+        .collect();
+    if out.is_empty() { None } else { Some(Value::Array(out)) }
+}
+
+/// Chat Completions -> Anthropic Messages payload
+fn chat_to_anthropic_payload(body: &Value, stream: bool) -> Value {
+    let mut system_text = String::new();
+    let mut messages = Vec::new();
+
+    if let Some(arr) = body.get("messages").and_then(|m| m.as_array()) {
+        for m in arr {
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            let content = m.get("content");
+            // system 消息提取到顶级 system 字段
+            if role == "system" {
+                let text = match content {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Array(parts)) => parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    _ => continue,
+                };
+                if !system_text.is_empty() { system_text.push('\n'); }
+                system_text.push_str(&text);
+                continue;
+            }
+            // assistant 带 tool_calls
+            if role == "assistant" && m.get("tool_calls").is_some() {
+                let mut blocks = Vec::new();
+                // 文本内容
+                let text = match content {
+                    Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+                    _ => None,
+                };
+                if let Some(t) = text {
+                    blocks.push(json!({"type": "text", "text": t}));
+                }
+                // tool_use blocks
+                for tc in m["tool_calls"].as_array().unwrap_or(&vec![]) {
+                    let input: Value = tc.pointer("/function/arguments")
+                        .and_then(|a| a.as_str())
+                        .and_then(|a| serde_json::from_str(a).ok())
+                        .unwrap_or(json!({}));
+                    blocks.push(json!({
+                        "type": "tool_use",
+                        "id": tc.get("id").and_then(|i| i.as_str()).unwrap_or(""),
+                        "name": tc.pointer("/function/name").and_then(|n| n.as_str()).unwrap_or(""),
+                        "input": input,
+                    }));
+                }
+                if blocks.is_empty() {
+                    blocks.push(json!({"type": "text", "text": ""}));
+                }
+                messages.push(json!({"role": "assistant", "content": blocks}));
+                continue;
+            }
+            // tool role -> user message with tool_result blocks
+            if role == "tool" {
+                let output = match content {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(v) => v.to_string(),
+                    None => "null".to_string(),
+                };
+                // 合并连续 tool 消息到同一个 user message
+                let tool_result_block = json!({
+                    "type": "tool_result",
+                    "tool_use_id": m.get("tool_call_id").and_then(|c| c.as_str()).unwrap_or(""),
+                    "content": output,
+                });
+                if let Some(last) = messages.last_mut() {
+                    if last.get("role").and_then(|r| r.as_str()) == Some("user") {
+                        if let Some(Value::Array(blocks)) = last.get_mut("content") {
+                            blocks.push(tool_result_block);
+                            continue;
+                        }
+                    }
+                }
+                messages.push(json!({"role": "user", "content": [tool_result_block]}));
+                continue;
+            }
+            // 普通 user/assistant 消息
+            let text = match content {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => continue,
+            };
+            if !text.is_empty() {
+                messages.push(json!({"role": role, "content": text}));
+            }
+        }
+    }
+
+    let mut payload = json!({
+        "messages": messages,
+        "stream": stream,
+    });
+    if let Some(m) = body.get("model") {
+        payload["model"] = m.clone();
+    }
+    if !system_text.is_empty() {
+        payload["system"] = json!(system_text);
+    }
+    if let Some(t) = chat_tools_to_anthropic(body.get("tools")) {
+        payload["tools"] = t;
+    }
+    for k in ["temperature", "top_p"] {
+        if let Some(v) = body.get(k) {
+            payload[k] = v.clone();
+        }
+    }
+    if let Some(mt) = body.get("max_tokens").or_else(|| body.get("max_completion_tokens")) {
+        payload["max_tokens"] = mt.clone();
+    }
+    if !cfg().model_override.is_empty() {
+        payload["model"] = json!(cfg().model_override);
+    }
+    payload
+}
+
+// ---------- 参数转换：Anthropic Messages -> Chat Completions ----------
+
+/// Anthropic tools -> Chat Completions tools
+fn anthropic_tools_to_chat(tools: Option<&Value>) -> Option<Value> {
+    let arr = tools?.as_array()?;
+    let out: Vec<Value> = arr
+        .iter()
+        .filter_map(|t| {
+            Some(json!({
+                "type": "function",
+                "function": {
+                    "name": t.get("name")?,
+                    "description": t.get("description"),
+                    "parameters": t.get("input_schema"),
+                },
+            }))
+        })
+        .filter(|t| t.pointer("/function/name").and_then(|n| n.as_str()).is_some())
+        .collect();
+    if out.is_empty() { None } else { Some(Value::Array(out)) }
+}
+
+/// Anthropic Messages -> Chat Completions payload
+fn anthropic_to_chat_payload(body: &Value, stream: bool) -> Value {
+    let mut messages = Vec::new();
+
+    // system 顶级字段 -> system message
+    if let Some(sys) = body.get("system") {
+        let text = match sys {
+            Value::String(s) => s.clone(),
+            Value::Array(blocks) => blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        if !text.is_empty() {
+            messages.push(json!({"role": "system", "content": text}));
+        }
+    }
+
+    if let Some(arr) = body.get("messages").and_then(|m| m.as_array()) {
+        for m in arr {
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            match m.get("content") {
+                Some(Value::String(s)) => {
+                    messages.push(json!({"role": role, "content": s}));
+                }
+                Some(Value::Array(blocks)) => {
+                    let mut text_parts = Vec::new();
+                    let mut tool_calls = Vec::new();
+                    let mut tool_results = Vec::new();
+                    for b in blocks {
+                        match b.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                            "text" => {
+                                if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                                    if !t.is_empty() { text_parts.push(t.to_string()); }
+                                }
+                            }
+                            "tool_use" => {
+                                tool_calls.push(json!({
+                                    "id": b.get("id").and_then(|i| i.as_str()).unwrap_or(""),
+                                    "type": "function",
+                                    "function": {
+                                        "name": b.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                                        "arguments": serde_json::to_string(b.get("input").unwrap_or(&json!({}))).unwrap_or_else(|_| "{}".into()),
+                                    },
+                                }));
+                            }
+                            "tool_result" => {
+                                let output = match b.get("content") {
+                                    Some(Value::String(s)) => s.clone(),
+                                    Some(v) => v.to_string(),
+                                    None => "null".to_string(),
+                                };
+                                tool_results.push(json!({
+                                    "role": "tool",
+                                    "tool_call_id": b.get("tool_use_id").and_then(|i| i.as_str()).unwrap_or(""),
+                                    "content": output,
+                                }));
+                            }
+                            _ => {}
+                        }
+                    }
+                    // assistant 消息: text + tool_calls
+                    if role == "assistant" {
+                        let mut msg = json!({"role": "assistant"});
+                        if !tool_calls.is_empty() {
+                            let mut content = text_parts.join("\n");
+                            if content.is_empty() { content = "".into(); }
+                            msg["content"] = json!(content);
+                            msg["tool_calls"] = Value::Array(tool_calls);
+                        } else {
+                            msg["content"] = json!(text_parts.join("\n"));
+                        }
+                        messages.push(msg);
+                    }
+                    // tool_results 作为独立的 tool role 消息
+                    for tr in tool_results {
+                        messages.push(tr);
+                    }
+                    // user 消息只有文本
+                    if role == "user" && !text_parts.is_empty() {
+                        messages.push(json!({"role": "user", "content": text_parts.join("\n")}));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut payload = json!({
+        "messages": messages,
+        "stream": stream,
+    });
+    if let Some(m) = body.get("model") {
+        payload["model"] = m.clone();
+    }
+    if let Some(t) = anthropic_tools_to_chat(body.get("tools")) {
+        payload["tools"] = t;
+    }
+    for k in ["temperature", "top_p"] {
+        if let Some(v) = body.get(k) {
+            payload[k] = v.clone();
+        }
+    }
+    if let Some(mt) = body.get("max_tokens") {
+        payload["max_tokens"] = mt.clone();
+    }
+    if !cfg().model_override.is_empty() {
+        payload["model"] = json!(cfg().model_override);
+    }
+    payload
+}
+
+// ---------- 参数转换：Responses API -> Anthropic Messages ----------
+
+/// Responses API -> Anthropic Messages payload
+fn responses_to_anthropic_payload(body: &Value, stream: bool) -> Value {
+    let mut system_text = String::new();
+    let mut messages = Vec::new();
+
+    if let Some(items) = body.get("input").and_then(|i| i.as_array()) {
+        for item in items {
+            let ty = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match ty {
+                "message" => {
+                    let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                    let content = item.get("content");
+                    let text = match content {
+                        Some(Value::Array(parts)) => parts
+                            .iter()
+                            .filter_map(|p| {
+                                let pty = p.get("type").and_then(|t| t.as_str())?;
+                                matches!(pty, "input_text" | "output_text" | "text")
+                                    .then(|| p.get("text").and_then(|t| t.as_str()).unwrap_or(""))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(""),
+                        Some(Value::String(s)) => s.clone(),
+                        _ => continue,
+                    };
+                    if role == "system" {
+                        if !system_text.is_empty() { system_text.push('\n'); }
+                        system_text.push_str(&text);
+                    } else {
+                        messages.push(json!({"role": role, "content": text}));
+                    }
+                }
+                "function_call" => {
+                    let input: Value = item.get("arguments")
+                        .and_then(|a| a.as_str())
+                        .and_then(|a| serde_json::from_str(a).ok())
+                        .unwrap_or(json!({}));
+                    messages.push(json!({
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": item.get("call_id").and_then(|c| c.as_str()).unwrap_or(""),
+                            "name": item.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                            "input": input,
+                        }],
+                    }));
+                }
+                "function_call_output" => {
+                    let output = item.get("output").and_then(|o| o.as_str()).unwrap_or("");
+                    messages.push(json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": item.get("call_id").and_then(|c| c.as_str()).unwrap_or(""),
+                            "content": output,
+                        }],
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut payload = json!({
+        "messages": messages,
+        "stream": stream,
+    });
+    if let Some(m) = body.get("model") {
+        payload["model"] = m.clone();
+    }
+    if !system_text.is_empty() {
+        payload["system"] = json!(system_text);
+    }
+    // Responses tools -> Anthropic tools
+    if let Some(arr) = body.get("tools").and_then(|t| t.as_array()) {
+        let out: Vec<Value> = arr
+            .iter()
+            .filter_map(|t| {
+                if t.get("type")?.as_str()? != "function" { return None; }
+                Some(json!({
+                    "name": t.get("name")?,
+                    "description": t.get("description"),
+                    "input_schema": t.get("parameters"),
+                }))
+            })
+            .filter(|t| t.get("name").and_then(|n| n.as_str()).is_some())
+            .collect();
+        if !out.is_empty() { payload["tools"] = Value::Array(out); }
+    }
+    for k in ["temperature", "top_p"] {
+        if let Some(v) = body.get(k) {
+            payload[k] = v.clone();
+        }
+    }
+    if let Some(mt) = body.get("max_output_tokens") {
+        payload["max_tokens"] = mt.clone();
     }
     if !cfg().model_override.is_empty() {
         payload["model"] = json!(cfg().model_override);
@@ -809,6 +1335,687 @@ async fn convert_stream_anthropic(
     (out_chars, usage)
 }
 
+// ---------- 响应侧转换：直通 + 非流式聚合 ----------
+
+/// 上游 Chat Completions SSE 直通到客户端 Chat Completions（+ token 统计）
+async fn passthrough_chat_stream(
+    upstream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+    _model: String,
+    tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    on_tokens: Option<Box<dyn Fn(u64) + Send + 'static>>,
+) -> (u64, stats::TokenCounts) {
+    let mut stream = upstream;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut out_chars: u64 = 0;
+    let mut usage = stats::TokenCounts { input: 0, output: 0, cached: 0 };
+    'outer: while let Some(chunk) = stream.next().await {
+        let Ok(bytes) = chunk else { break };
+        if tx.send(Ok(bytes.to_vec())).await.is_err() { break; }
+        buf.extend_from_slice(&bytes);
+        while let Some(pos) = find_double_newline(&buf) {
+            let event_bytes: Vec<u8> = buf.drain(..pos + 2).collect();
+            let text = String::from_utf8_lossy(&event_bytes);
+            if let Some(data_line) = text.lines().rev().find(|l| l.trim_start().starts_with("data:")) {
+                let payload = data_line.trim_start()["data:".len()..].trim();
+                if payload == "[DONE]" { break 'outer; }
+                if let Ok(obj) = serde_json::from_str::<Value>(payload) {
+                    if let Some(delta) = obj.pointer("/choices/0/delta/content").and_then(|c| c.as_str()) {
+                        out_chars += delta.chars().count() as u64;
+                    }
+                    if let Some(u) = obj.get("usage") {
+                        usage.input = u.pointer("/prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                        usage.output = u.pointer("/completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                        usage.cached = u.pointer("/prompt_tokens_details/cached_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(ref cb) = on_tokens { cb(out_chars); }
+    if usage.output == 0 { usage.output = out_chars.div_ceil(3); }
+    (out_chars, usage)
+}
+
+/// 上游 Anthropic SSE 直通到客户端 Anthropic Messages（+ token 统计）
+async fn passthrough_anthropic_stream(
+    upstream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+    _model: String,
+    tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    on_tokens: Option<Box<dyn Fn(u64) + Send + 'static>>,
+) -> (u64, stats::TokenCounts) {
+    let mut stream = upstream;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut out_chars: u64 = 0;
+    let mut usage = stats::TokenCounts { input: 0, output: 0, cached: 0 };
+    'outer: while let Some(chunk) = stream.next().await {
+        let Ok(bytes) = chunk else { break };
+        if tx.send(Ok(bytes.to_vec())).await.is_err() { break; }
+        buf.extend_from_slice(&bytes);
+        while let Some(pos) = find_double_newline(&buf) {
+            let event_bytes: Vec<u8> = buf.drain(..pos + 2).collect();
+            let text = String::from_utf8_lossy(&event_bytes);
+            if let Some(data_line) = text.lines().rev().find(|l| l.trim_start().starts_with("data:")) {
+                let payload = data_line.trim_start()["data:".len()..].trim();
+                if let Ok(obj) = serde_json::from_str::<Value>(payload) {
+                    let evt_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    if evt_type == "content_block_delta" {
+                        if let Some(d) = obj.pointer("/delta/text").and_then(|t| t.as_str()) {
+                            out_chars += d.chars().count() as u64;
+                        }
+                    } else if evt_type == "message_delta" {
+                        if let Some(u) = obj.get("usage") {
+                            usage.output = u.pointer("/output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                        }
+                    } else if evt_type == "message_start" {
+                        if let Some(u) = obj.pointer("/message/usage") {
+                            usage.input = u.pointer("/input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                            usage.cached = u.pointer("/cache_read_input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(ref cb) = on_tokens { cb(out_chars); }
+    if usage.output == 0 { usage.output = out_chars.div_ceil(3); }
+    (out_chars, usage)
+}
+
+/// 非流式聚合：上游 Chat Completions JSON -> 客户端 Responses JSON
+fn chat_json_to_responses(v: &Value, model: &str) -> Value {
+    let msg = v.pointer("/choices/0/message").cloned().unwrap_or(json!({}));
+    let mut output_items = Vec::new();
+    if let Some(t) = msg.get("content").and_then(|c| c.as_str()) {
+        if !t.is_empty() {
+            output_items.push(json!({
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": t}],
+            }));
+        }
+    }
+    for tc in msg.get("tool_calls").and_then(|t| t.as_array()).unwrap_or(&vec![]) {
+        output_items.push(json!({
+            "type": "function_call",
+            "call_id": tc.get("id").and_then(|i| i.as_str()).unwrap_or(""),
+            "name": tc.pointer("/function/name").and_then(|n| n.as_str()).unwrap_or(""),
+            "arguments": tc.pointer("/function/arguments").and_then(|a| a.as_str()).unwrap_or("{}"),
+        }));
+    }
+    let u = v.get("usage").cloned().unwrap_or(json!({}));
+    json!({
+        "id": format!("resp-{}", next_request_id()),
+        "object": "response",
+        "model": model,
+        "output": output_items,
+        "usage": {
+            "input_tokens": u.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+            "output_tokens": u.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+            "cached_tokens": u.pointer("/prompt_tokens_details/cached_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+        },
+    })
+}
+
+/// 非流式聚合：上游 Anthropic JSON -> 客户端 Responses JSON
+fn anthropic_json_to_responses(v: &Value, model: &str) -> Value {
+    let mut output_items = Vec::new();
+    if let Some(content) = v.get("content").and_then(|c| c.as_array()) {
+        for block in content {
+            match block.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "text" => {
+                    let t = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    if !t.is_empty() {
+                        output_items.push(json!({
+                            "type": "message", "role": "assistant",
+                            "content": [{"type": "output_text", "text": t}],
+                        }));
+                    }
+                }
+                "tool_use" => {
+                    output_items.push(json!({
+                        "type": "function_call",
+                        "call_id": block.get("id").and_then(|i| i.as_str()).unwrap_or(""),
+                        "name": block.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                        "arguments": serde_json::to_string(block.get("input").unwrap_or(&json!({}))).unwrap_or_else(|_| "{}".into()),
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+    let u = v.get("usage").cloned().unwrap_or(json!({}));
+    json!({
+        "id": format!("resp-{}", next_request_id()),
+        "object": "response",
+        "model": model,
+        "output": output_items,
+        "usage": {
+            "input_tokens": u.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+            "output_tokens": u.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+        },
+    })
+}
+
+/// 非流式聚合：上游 Anthropic JSON -> 客户端 Chat Completions JSON
+fn anthropic_json_to_chat(v: &Value) -> Value {
+    let mut content_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+    if let Some(content) = v.get("content").and_then(|c| c.as_array()) {
+        for block in content {
+            match block.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "text" => {
+                    let t = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    if !t.is_empty() { content_parts.push(t.to_string()); }
+                }
+                "tool_use" => {
+                    tool_calls.push(json!({
+                        "id": block.get("id").and_then(|i| i.as_str()).unwrap_or(""),
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                            "arguments": serde_json::to_string(block.get("input").unwrap_or(&json!({}))).unwrap_or_else(|_| "{}".into()),
+                        },
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+    let text = content_parts.concat();
+    let stop = v.get("stop_reason").and_then(|s| s.as_str()).unwrap_or("end_turn");
+    let finish_reason = if stop == "tool_use" { "tool_calls" } else { "stop" };
+    let mut message = json!({
+        "role": "assistant",
+        "content": if text.is_empty() { Value::Null } else { json!(text) },
+    });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = Value::Array(tool_calls);
+    }
+    json!({
+        "id": format!("chatcmpl-{}", next_request_id()),
+        "object": "chat.completion",
+        "created": 1_700_000_000u64,
+        "model": v.get("model").cloned().unwrap_or(json!("")),
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "usage": v.get("usage").cloned().unwrap_or(json!({})),
+    })
+}
+
+/// 非流式聚合：上游 Responses JSON -> 客户端 Chat Completions JSON
+fn responses_to_chat_json(v: &Value, model: &str) -> Value {
+    let mut content_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+    if let Some(items) = v.get("output").and_then(|o| o.as_array()) {
+        for item in items {
+            match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "message" => {
+                    if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
+                        for part in content {
+                            if part.get("type").and_then(|t| t.as_str()) == Some("output_text") {
+                                if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                                    if !t.is_empty() { content_parts.push(t.to_string()); }
+                                }
+                            }
+                        }
+                    }
+                }
+                "function_call" => {
+                    tool_calls.push(json!({
+                        "id": item.get("call_id").and_then(|i| i.as_str()).unwrap_or(""),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                            "arguments": item.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}"),
+                        },
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+    let text = content_parts.concat();
+    let has_tools = !tool_calls.is_empty();
+    let mut message = json!({
+        "role": "assistant",
+        "content": if text.is_empty() { Value::Null } else { json!(text) },
+    });
+    if has_tools {
+        message["tool_calls"] = Value::Array(tool_calls);
+    }
+    let u = v.get("usage").cloned().unwrap_or(json!({}));
+    json!({
+        "id": format!("chatcmpl-{}", next_request_id()),
+        "object": "chat.completion",
+        "created": 1_700_000_000u64,
+        "model": model,
+        "choices": [{"index": 0, "message": message, "finish_reason": if has_tools { "tool_calls" } else { "stop" }}],
+        "usage": {
+            "prompt_tokens": u.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+            "completion_tokens": u.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+            "total_tokens": (u.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0) + u.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0)),
+        },
+    })
+}
+
+/// 非流式聚合：上游 Chat Completions JSON -> Anthropic Messages JSON
+fn chat_json_to_anthropic(v: &Value) -> Value {
+    let model = v.get("model").cloned().unwrap_or(json!(""));
+    let msg = v.pointer("/choices/0/message").cloned().unwrap_or(json!({}));
+
+    let mut content: Vec<Value> = Vec::new();
+    if let Some(t) = msg.get("content").and_then(|c| c.as_str()) {
+        if !t.is_empty() {
+            content.push(json!({"type": "text", "text": t}));
+        }
+    }
+    for tc in msg.get("tool_calls").and_then(|t| t.as_array()).unwrap_or(&vec![]) {
+        let args = tc.pointer("/function/arguments").and_then(|a| a.as_str()).unwrap_or("{}");
+        let input: Value = serde_json::from_str(args).unwrap_or(json!({}));
+        content.push(json!({
+            "type": "tool_use",
+            "id": tc.get("id").and_then(|i| i.as_str()).unwrap_or(""),
+            "name": tc.pointer("/function/name").and_then(|n| n.as_str()).unwrap_or(""),
+            "input": input,
+        }));
+    }
+    if content.is_empty() {
+        content.push(json!({"type": "text", "text": ""}));
+    }
+    let stop_reason = if v.pointer("/choices/0/finish_reason").and_then(|f| f.as_str()) == Some("tool_calls") {
+        "tool_use"
+    } else {
+        "end_turn"
+    };
+    let usage = v.get("usage").cloned().unwrap_or(json!({}));
+    json!({
+        "id": format!("msg_{}", next_request_id()),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": Value::Null,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+            "output_tokens": usage.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+        },
+    })
+}
+
+// ---------- 响应侧流式转换：上游 Chat SSE -> 客户端 Responses SSE ----------
+
+async fn convert_stream_chat_to_responses(
+    upstream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+    model: String,
+    tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    on_tokens: Option<Box<dyn Fn(u64) + Send + 'static>>,
+) -> (u64, bool, stats::TokenCounts) {
+    let mut stream = upstream;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut out_chars: u64 = 0;
+    let mut used_tool_calls = false;
+    let mut usage = stats::TokenCounts { input: 0, output: 0, cached: 0 };
+    let mut text_started = false;
+
+    'outer: while let Some(chunk) = stream.next().await {
+        let Ok(bytes) = chunk else { break };
+        buf.extend_from_slice(&bytes);
+        while let Some(pos) = find_double_newline(&buf) {
+            let event_bytes: Vec<u8> = buf.drain(..pos + 2).collect();
+            let text = String::from_utf8_lossy(&event_bytes);
+            let data_line = text.lines().rev().find(|l| l.trim_start().starts_with("data:"));
+            let Some(data_line) = data_line else { continue };
+            let payload = data_line.trim_start()["data:".len()..].trim();
+            if payload == "[DONE]" { break 'outer; }
+            let Ok(obj) = serde_json::from_str::<Value>(payload) else { continue };
+
+            if let Some(ref cb) = on_tokens { cb(out_chars); }
+
+            // 文本 delta
+            if let Some(content) = obj.pointer("/choices/0/delta/content").and_then(|c| c.as_str()) {
+                if !text_started {
+                    text_started = true;
+                    let _ = tx.send(Ok(sse_frame(&json!({
+                        "type": "response.output_text.delta",
+                        "delta": "",
+                    })))).await;
+                }
+                out_chars += content.chars().count() as u64;
+                let _ = tx.send(Ok(sse_frame(&json!({
+                    "type": "response.output_text.delta",
+                    "delta": content,
+                })))).await;
+            }
+            // tool_calls delta
+            if let Some(tcs) = obj.pointer("/choices/0/delta/tool_calls").and_then(|t| t.as_array()) {
+                for tc in tcs {
+                    used_tool_calls = true;
+                    if let Some(name) = tc.pointer("/function/name").and_then(|n| n.as_str()) {
+                        let _ = tx.send(Ok(sse_frame(&json!({
+                            "type": "response.output_item.added",
+                            "item": {"type": "function_call", "name": name},
+                        })))).await;
+                    }
+                    if let Some(args) = tc.pointer("/function/arguments").and_then(|a| a.as_str()) {
+                        out_chars += args.chars().count() as u64;
+                        let _ = tx.send(Ok(sse_frame(&json!({
+                            "type": "response.function_call_arguments.delta",
+                            "delta": args,
+                        })))).await;
+                    }
+                }
+            }
+            // usage
+            if let Some(u) = obj.get("usage") {
+                usage.input = u.pointer("/prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                usage.output = u.pointer("/completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                usage.cached = u.pointer("/prompt_tokens_details/cached_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+            }
+        }
+    }
+    if let Some(ref cb) = on_tokens { cb(out_chars); }
+    if usage.output == 0 { usage.output = out_chars.div_ceil(3); }
+    (out_chars, used_tool_calls, usage)
+}
+
+// ---------- 响应侧流式转换：上游 Anthropic SSE -> 客户端 Responses SSE ----------
+
+async fn convert_stream_anthropic_to_responses(
+    upstream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+    model: String,
+    tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    on_tokens: Option<Box<dyn Fn(u64) + Send + 'static>>,
+) -> (u64, bool, stats::TokenCounts) {
+    let mut stream = upstream;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut out_chars: u64 = 0;
+    let mut used_tool_calls = false;
+    let mut usage = stats::TokenCounts { input: 0, output: 0, cached: 0 };
+
+    'outer: while let Some(chunk) = stream.next().await {
+        let Ok(bytes) = chunk else { break };
+        buf.extend_from_slice(&bytes);
+        while let Some(pos) = find_double_newline(&buf) {
+            let event_bytes: Vec<u8> = buf.drain(..pos + 2).collect();
+            let text = String::from_utf8_lossy(&event_bytes);
+            let data_line = text.lines().rev().find(|l| l.trim_start().starts_with("data:"));
+            let Some(data_line) = data_line else { continue };
+            let payload = data_line.trim_start()["data:".len()..].trim();
+            if let Ok(obj) = serde_json::from_str::<Value>(payload) {
+                let evt_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if let Some(ref cb) = on_tokens { cb(out_chars); }
+                match evt_type {
+                    "content_block_delta" => {
+                        // 文本 delta -> Responses output_text.delta
+                        if let Some(d) = obj.pointer("/delta/text").and_then(|t| t.as_str()) {
+                            out_chars += d.chars().count() as u64;
+                            let _ = tx.send(Ok(sse_frame(&json!({
+                                "type": "response.output_text.delta",
+                                "delta": d,
+                            })))).await;
+                        }
+                        // tool input_json_delta -> Responses function_call_arguments.delta
+                        if obj.pointer("/delta/type").and_then(|t| t.as_str()) == Some("input_json_delta") {
+                            if let Some(args) = obj.pointer("/delta/partial_json").and_then(|a| a.as_str()) {
+                                out_chars += args.chars().count() as u64;
+                                let _ = tx.send(Ok(sse_frame(&json!({
+                                    "type": "response.function_call_arguments.delta",
+                                    "delta": args,
+                                })))).await;
+                            }
+                        }
+                    }
+                    "content_block_start" => {
+                        let block = obj.get("content_block").cloned().unwrap_or(json!({}));
+                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                            used_tool_calls = true;
+                            let _ = tx.send(Ok(sse_frame(&json!({
+                                "type": "response.output_item.added",
+                                "item": {
+                                    "type": "function_call",
+                                    "name": block.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                                },
+                            })))).await;
+                        }
+                    }
+                    "message_start" => {
+                        if let Some(u) = obj.pointer("/message/usage") {
+                            usage.input = u.pointer("/input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                            usage.cached = u.pointer("/cache_read_input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                        }
+                    }
+                    "message_delta" => {
+                        if let Some(u) = obj.get("usage") {
+                            usage.output = u.pointer("/output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if let Some(ref cb) = on_tokens { cb(out_chars); }
+    if usage.output == 0 { usage.output = out_chars.div_ceil(3); }
+    (out_chars, used_tool_calls, usage)
+}
+
+// ---------- 响应侧流式转换：上游 Chat SSE -> 客户端 Anthropic SSE ----------
+
+async fn convert_stream_chat_to_anthropic(
+    upstream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+    model: String,
+    tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    on_tokens: Option<Box<dyn Fn(u64) + Send + 'static>>,
+) -> (u64, stats::TokenCounts) {
+    let mut stream = upstream;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut out_chars: u64 = 0;
+    let mut usage = stats::TokenCounts { input: 0, output: 0, cached: 0 };
+    let mut started = false;
+    let mut text_index: Option<usize> = None;
+    let mut next_index = 0usize;
+
+    macro_rules! ensure_started {
+        () => {
+            if !started {
+                started = true;
+                let _ = tx.send(Ok(anthropic_sse("message_start", &json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": format!("msg_{}", next_request_id()),
+                        "type": "message",
+                        "role": "assistant",
+                        "model": model,
+                        "content": [],
+                        "stop_reason": Value::Null,
+                        "stop_sequence": Value::Null,
+                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                    },
+                })))).await;
+            }
+        };
+    }
+
+    'outer: while let Some(chunk) = stream.next().await {
+        let Ok(bytes) = chunk else { break };
+        buf.extend_from_slice(&bytes);
+        while let Some(pos) = find_double_newline(&buf) {
+            let event_bytes: Vec<u8> = buf.drain(..pos + 2).collect();
+            let text = String::from_utf8_lossy(&event_bytes);
+            let data_line = text.lines().rev().find(|l| l.trim_start().starts_with("data:"));
+            let Some(data_line) = data_line else { continue };
+            let payload = data_line.trim_start()["data:".len()..].trim();
+            if payload == "[DONE]" { break 'outer; }
+            let Ok(obj) = serde_json::from_str::<Value>(payload) else { continue };
+
+            if let Some(ref cb) = on_tokens { cb(out_chars); }
+
+            if let Some(content) = obj.pointer("/choices/0/delta/content").and_then(|c| c.as_str()) {
+                ensure_started!();
+                let ti = match text_index {
+                    Some(i) => i,
+                    None => {
+                        let i = next_index;
+                        next_index += 1;
+                        text_index = Some(i);
+                        let _ = tx.send(Ok(anthropic_sse("content_block_start", &json!({
+                            "type": "content_block_start",
+                            "index": i,
+                            "content_block": {"type": "text", "text": ""},
+                        })))).await;
+                        i
+                    }
+                };
+                out_chars += content.chars().count() as u64;
+                let _ = tx.send(Ok(anthropic_sse("content_block_delta", &json!({
+                    "type": "content_block_delta",
+                    "index": ti,
+                    "delta": {"type": "text_delta", "text": content},
+                })))).await;
+            }
+            // tool_calls
+            if let Some(tcs) = obj.pointer("/choices/0/delta/tool_calls").and_then(|t| t.as_array()) {
+                ensure_started!();
+                for tc in tcs {
+                    if let Some(name) = tc.pointer("/function/name").and_then(|n| n.as_str()) {
+                        let bi = next_index;
+                        next_index += 1;
+                        let _ = tx.send(Ok(anthropic_sse("content_block_start", &json!({
+                            "type": "content_block_start",
+                            "index": bi,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": tc.get("id").and_then(|i| i.as_str()).unwrap_or(""),
+                                "name": name,
+                                "input": {},
+                            },
+                        })))).await;
+                    }
+                    if let Some(args) = tc.pointer("/function/arguments").and_then(|a| a.as_str()) {
+                        out_chars += args.chars().count() as u64;
+                        let _ = tx.send(Ok(anthropic_sse("content_block_delta", &json!({
+                            "type": "content_block_delta",
+                            "index": next_index - 1,
+                            "delta": {"type": "input_json_delta", "partial_json": args},
+                        })))).await;
+                    }
+                }
+            }
+            // usage from final chunk
+            if let Some(u) = obj.get("usage") {
+                usage.input = u.pointer("/prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                usage.output = u.pointer("/completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                usage.cached = u.pointer("/prompt_tokens_details/cached_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+            }
+        }
+    }
+    ensure_started!();
+    // close text block
+    if text_index.is_some() {
+        let _ = tx.send(Ok(anthropic_sse("content_block_stop", &json!({
+            "type": "content_block_stop", "index": text_index.unwrap(),
+        })))).await;
+    }
+    let stop_reason = if usage.output > 0 { "end_turn" } else { "end_turn" };
+    let _ = tx.send(Ok(anthropic_sse("message_delta", &json!({
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
+        "usage": {"output_tokens": out_chars.div_ceil(3)},
+    })))).await;
+    let _ = tx.send(Ok(anthropic_sse("message_stop", &json!({"type": "message_stop"})))).await;
+
+    if let Some(ref cb) = on_tokens { cb(out_chars); }
+    if usage.output == 0 { usage.output = out_chars.div_ceil(3); }
+    (out_chars, usage)
+}
+
+// ---------- 响应侧流式转换：上游 Anthropic SSE -> 客户端 Chat SSE ----------
+
+async fn convert_stream_anthropic_to_chat(
+    upstream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+    model: String,
+    tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    on_tokens: Option<Box<dyn Fn(u64) + Send + 'static>>,
+) -> (u64, bool, stats::TokenCounts) {
+    let mut stream = upstream;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut out_chars: u64 = 0;
+    let mut used_tool_calls = false;
+    let mut usage = stats::TokenCounts { input: 0, output: 0, cached: 0 };
+    let mut started = false;
+
+    macro_rules! send_role {
+        () => {
+            if !started {
+                started = true;
+                let _ = tx.send(Ok(sse_frame(&make_chunk(&model, json!({"role": "assistant"}), None)))).await;
+            }
+        };
+    }
+
+    'outer: while let Some(chunk) = stream.next().await {
+        let Ok(bytes) = chunk else { break };
+        buf.extend_from_slice(&bytes);
+        while let Some(pos) = find_double_newline(&buf) {
+            let event_bytes: Vec<u8> = buf.drain(..pos + 2).collect();
+            let text = String::from_utf8_lossy(&event_bytes);
+            let data_line = text.lines().rev().find(|l| l.trim_start().starts_with("data:"));
+            let Some(data_line) = data_line else { continue };
+            let payload = data_line.trim_start()["data:".len()..].trim();
+            let Ok(obj) = serde_json::from_str::<Value>(payload) else { continue };
+            let evt_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+            if let Some(ref cb) = on_tokens { cb(out_chars); }
+
+            match evt_type {
+                "content_block_delta" => {
+                    send_role!();
+                    if let Some(d) = obj.pointer("/delta/text").and_then(|t| t.as_str()) {
+                        out_chars += d.chars().count() as u64;
+                        let _ = tx.send(Ok(sse_frame(&make_chunk(&model, json!({"content": d}), None)))).await;
+                    }
+                    if obj.pointer("/delta/type").and_then(|t| t.as_str()) == Some("input_json_delta") {
+                        if let Some(args) = obj.pointer("/delta/partial_json").and_then(|a| a.as_str()) {
+                            out_chars += args.chars().count() as u64;
+                            let _ = tx.send(Ok(sse_frame(&make_chunk(&model, json!({
+                                "tool_calls": [{"index": 0, "function": {"arguments": args}}],
+                            }), None)))).await;
+                        }
+                    }
+                }
+                "content_block_start" => {
+                    let block = obj.get("content_block").cloned().unwrap_or(json!({}));
+                    if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                        send_role!();
+                        used_tool_calls = true;
+                        let _ = tx.send(Ok(sse_frame(&make_chunk(&model, json!({
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": block.get("id").and_then(|i| i.as_str()).unwrap_or(""),
+                                "function": {"name": block.get("name").and_then(|n| n.as_str()).unwrap_or(""), "arguments": ""},
+                            }],
+                        }), None)))).await;
+                    }
+                }
+                "message_start" => {
+                    if let Some(u) = obj.pointer("/message/usage") {
+                        usage.input = u.pointer("/input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                        usage.cached = u.pointer("/cache_read_input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                    }
+                }
+                "message_delta" => {
+                    if let Some(u) = obj.get("usage") {
+                        usage.output = u.pointer("/output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(ref cb) = on_tokens { cb(out_chars); }
+    if usage.output == 0 { usage.output = out_chars.div_ceil(3); }
+    (out_chars, used_tool_calls, usage)
+}
+
 // ---------- 上游请求（含重试）----------
 
 /// 软并发调度：最多等待 120 秒获取一个并发槽位；返回 None 表示等待超时。
@@ -1099,7 +2306,17 @@ async fn chat_completions(
 ) -> Response {
     let user_agent = request_user_agent(&headers);
     let wants_stream = chat_body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
-    let payload = chat_to_responses_payload(&chat_body, wants_stream);
+    let upstream_fmt = cfg().upstream_format;
+    let (payload, to_responses) = match upstream_fmt {
+        UpstreamFormat::Responses => (chat_to_responses_payload(&chat_body, wants_stream), true),
+        UpstreamFormat::Anthropic => (chat_to_anthropic_payload(&chat_body, wants_stream), false),
+        UpstreamFormat::ChatCompletions => {
+            // 直通：只替换 model_override
+            let mut b = chat_body.clone();
+            if !cfg().model_override.is_empty() { b["model"] = json!(cfg().model_override); }
+            (b, false)
+        }
+    };
     let model = payload
         .get("model")
         .and_then(|m| m.as_str())
@@ -1122,18 +2339,61 @@ async fn chat_completions(
     }
 
     if !wants_stream {
-        let (cc, chars, upstream_usage) = aggregate_chat_completion(upstream, model).await;
-        let tc = if upstream_usage.input > 0 || upstream_usage.output > 0 {
-            upstream_usage
+        if to_responses {
+            // 上游返回 Responses 格式 -> 转为 Chat Completions
+            let full = upstream.text().await.unwrap_or_default();
+            let tc = match serde_json::from_str::<Value>(&full) {
+                Ok(v) => {
+                    let input = v.pointer("/usage/input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                    let output = v.pointer("/usage/output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                    let cached = v.pointer("/usage/cached_tokens").and_then(|t| t.as_u64())
+                        .or_else(|| v.pointer("/usage/input_tokens_details/cached_tokens").and_then(|t| t.as_u64()))
+                        .unwrap_or(0);
+                    stats::TokenCounts { input, output, cached }
+                }
+                Err(_) => stats::TokenCounts { input: 0, output: 0, cached: 0 },
+            };
+            // 把 Responses JSON 转为 Chat Completions JSON
+            let cc = responses_to_chat_json(&serde_json::from_str::<Value>(&full).unwrap_or(json!({})), &model);
+            stats::update_tokens_db_only(guard.idx(), tc);
+            guard.release();
+            if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
+            return (StatusCode::OK, Json(cc)).into_response();
+        } else if upstream_fmt == UpstreamFormat::ChatCompletions {
+            // 上游返回 Chat Completions 格式 -> 直通（已经是客户端期望的格式）
+            let content_type = upstream.headers().get("content-type")
+                .and_then(|v| v.to_str().ok()).unwrap_or("application/json").to_string();
+            let full = upstream.text().await.unwrap_or_default();
+            let tc = match serde_json::from_str::<Value>(&full) {
+                Ok(v) => {
+                    let input = v.pointer("/usage/prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                    let output = v.pointer("/usage/completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                    let cached = v.pointer("/usage/prompt_tokens_details/cached_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                    stats::TokenCounts { input, output, cached }
+                }
+                Err(_) => stats::TokenCounts { input: 0, output: 0, cached: 0 },
+            };
+            stats::update_tokens_db_only(guard.idx(), tc);
+            guard.release();
+            if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
+            return Response::builder().status(StatusCode::OK)
+                .header("content-type", content_type)
+                .body(Body::from(full)).unwrap();
         } else {
-            stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 }
-        };
-        stats::update_tokens_db_only(guard.idx(), tc);
-        guard.release();
-        if let Some(h) = APP_HANDLE.get() {
-            let _ = h.emit("stats-updated", ());
+            // 上游返回 Anthropic 格式 -> 转为 Chat Completions
+            let full = upstream.text().await.unwrap_or_default();
+            let v = serde_json::from_str::<Value>(&full).unwrap_or(json!({}));
+            let tc = stats::TokenCounts {
+                input: v.pointer("/usage/input_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+                output: v.pointer("/usage/output_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+                cached: 0,
+            };
+            let cc = anthropic_json_to_chat(&v);
+            stats::update_tokens_db_only(guard.idx(), tc);
+            guard.release();
+            if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
+            return (StatusCode::OK, Json(cc)).into_response();
         }
-        return (StatusCode::OK, Json(cc)).into_response();
     }
 
     // 流式：边读边转换，实时更新 token 数
@@ -1144,42 +2404,38 @@ async fn chat_completions(
     tokio::spawn(async move {
         let first = make_chunk(&model, json!({"role": "assistant"}), None);
         let _ = tx.send(Ok(sse_frame(&first))).await;
-
         let cb: Box<dyn Fn(u64) + Send> = Box::new(move |chars: u64| {
             stats::update_tokens_db_only(idx, stats::TokenCounts {
                 input: 0, output: chars.div_ceil(3), cached: 0,
             });
-            if let Some(h) = APP_HANDLE.get() {
-                let _ = h.emit("stats-updated", ());
-            }
+            if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
         });
-        let result = tokio::time::timeout(
-            STREAM_TIMEOUT,
-            convert_stream(byte_stream, model.clone(), &tx, Some(cb)),
-        )
-        .await;
+        let result = tokio::time::timeout(STREAM_TIMEOUT, async {
+            if to_responses {
+                // 上游 Responses SSE -> Chat Completions SSE
+                convert_stream_chat_to_responses(byte_stream, model.clone(), &tx, Some(cb)).await
+            } else if upstream_fmt == UpstreamFormat::ChatCompletions {
+                // 上游 Chat SSE -> Chat SSE 直通
+                let (chars, tc) = passthrough_chat_stream(byte_stream, model.clone(), &tx, Some(cb)).await;
+                (chars, false, tc)
+            } else {
+                // 上游 Anthropic SSE -> Chat SSE
+                let (_c, _used, tc) = convert_stream_anthropic_to_chat(byte_stream, model.clone(), &tx, Some(cb)).await;
+                (_c, false, tc)
+            }
+        }).await;
         let (chars, tool_used, upstream_usage) = match result {
             Ok(v) => v,
-            Err(_) => {
-                eprintln!("[proxy] 流式超时，强制释放并发槽位");
-                (0, false, stats::TokenCounts { input: 0, output: 0, cached: 0 })
-            }
+            Err(_) => { (0u64, false, stats::TokenCounts { input: 0, output: 0, cached: 0 }) }
         };
-
         let finish = make_chunk(&model, json!({}), Some(if tool_used { "tool_calls" } else { "stop" }));
         let _ = tx.send(Ok(sse_frame(&finish))).await;
         let _ = tx.send(Ok(b"data: [DONE]\n\n".to_vec())).await;
         drop(tx);
-
-        let tc = if upstream_usage.input > 0 || upstream_usage.output > 0 {
-            upstream_usage
-        } else {
-            stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 }
-        };
+        let tc = if upstream_usage.input > 0 || upstream_usage.output > 0 { upstream_usage }
+        else { stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 } };
         stats::update_last_tokens(idx, tc);
-        if let Some(h) = APP_HANDLE.get() {
-            let _ = h.emit("stats-updated", ());
-        }
+        if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
     });
 
     sse_response(rx)
@@ -1203,6 +2459,15 @@ async fn responses_api(
         Err(resp) => return resp,
     };
 
+    // 按上游格式转换请求
+    let upstream_fmt = cfg().upstream_format;
+    let body = match upstream_fmt {
+        UpstreamFormat::Responses => body,  // 直通
+        UpstreamFormat::ChatCompletions => responses_to_chat_payload(&body, wants_stream),
+        UpstreamFormat::Anthropic => responses_to_anthropic_payload(&body, wants_stream),
+    };
+    let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
+
     let upstream = match send_upstream(&body, &user_agent).await {
         Ok(r) => r,
         Err((status, err)) => return (status, Json(err)).into_response(),
@@ -1213,35 +2478,44 @@ async fn responses_api(
     }
 
     if !wants_stream {
-        let content_type = upstream
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("application/json")
-            .to_string();
+        let content_type = upstream.headers().get("content-type")
+            .and_then(|v| v.to_str().ok()).unwrap_or("application/json").to_string();
         let full = upstream.text().await.unwrap_or_default();
-        let tc = match serde_json::from_str::<Value>(&full) {
-            Ok(v) => {
-                let input = v.pointer("/usage/input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-                let output = v.pointer("/usage/output_tokens").and_then(|t| t.as_u64())
-                    .unwrap_or_else(|| estimate_response_output_chars(&v).div_ceil(3));
-                let cached = v.pointer("/usage/cached_tokens").and_then(|t| t.as_u64())
-                    .or_else(|| v.pointer("/usage/input_tokens_details/cached_tokens").and_then(|t| t.as_u64()))
+        let upstream_val = serde_json::from_str::<Value>(&full).unwrap_or(json!({}));
+        // 转换响应为 Responses 格式
+        let response_val = match upstream_fmt {
+            UpstreamFormat::Responses => upstream_val.clone(),
+            UpstreamFormat::ChatCompletions => chat_json_to_responses(&upstream_val, &model),
+            UpstreamFormat::Anthropic => anthropic_json_to_responses(&upstream_val, &model),
+        };
+        let tc = match upstream_fmt {
+            UpstreamFormat::Responses => {
+                let input = upstream_val.pointer("/usage/input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                let output = upstream_val.pointer("/usage/output_tokens").and_then(|t| t.as_u64())
+                    .unwrap_or_else(|| estimate_response_output_chars(&upstream_val).div_ceil(3));
+                let cached = upstream_val.pointer("/usage/cached_tokens").and_then(|t| t.as_u64())
+                    .or_else(|| upstream_val.pointer("/usage/input_tokens_details/cached_tokens").and_then(|t| t.as_u64()))
                     .unwrap_or(0);
                 stats::TokenCounts { input, output, cached }
             }
-            Err(_) => stats::TokenCounts { input: 0, output: 0, cached: 0 },
+            UpstreamFormat::ChatCompletions => {
+                let input = upstream_val.pointer("/usage/prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                let output = upstream_val.pointer("/usage/completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                let cached = upstream_val.pointer("/usage/prompt_tokens_details/cached_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                stats::TokenCounts { input, output, cached }
+            }
+            UpstreamFormat::Anthropic => {
+                let input = upstream_val.pointer("/usage/input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                let output = upstream_val.pointer("/usage/output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                stats::TokenCounts { input, output, cached: 0 }
+            }
         };
         stats::update_tokens_db_only(guard.idx(), tc);
         guard.release();
-        if let Some(h) = APP_HANDLE.get() {
-            let _ = h.emit("stats-updated", ());
-        }
-        return Response::builder()
-            .status(StatusCode::OK)
+        if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
+        return Response::builder().status(StatusCode::OK)
             .header("content-type", content_type)
-            .body(Body::from(full))
-            .unwrap();
+            .body(Body::from(serde_json::to_string(&response_val).unwrap_or_default())).unwrap();
     }
 
     // 流式：字节原样透传，同时旁路统计 output_text.delta 的字符数
@@ -1249,66 +2523,69 @@ async fn responses_api(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(256);
     let idx = guard.disarm();
     tokio::spawn(async move {
-        let mut stream = byte_stream;
-        let mut pending: Vec<u8> = Vec::new();
         let mut chars: u64 = 0;
         let mut usage = stats::TokenCounts { input: 0, output: 0, cached: 0 };
-        loop {
-            let next = match tokio::time::timeout(STREAM_TIMEOUT, stream.next()).await {
-                Ok(Some(chunk)) => chunk,
-                Ok(None) => break,
-                Err(_) => {
-                    eprintln!("[proxy] Responses 流式超时，强制释放并发槽位");
-                    break;
-                }
-            };
-            let Ok(bytes) = next else { break };
-            if tx.send(Ok(bytes.to_vec())).await.is_err() {
-                break;
-            }
-            pending.extend_from_slice(&bytes);
-            while let Some(pos) = find_double_newline(&pending) {
-                let event_bytes: Vec<u8> = pending.drain(..pos + 2).collect();
-                let text = String::from_utf8_lossy(&event_bytes);
-                if let Some(data_line) = text.lines().rev().find(|l| l.trim_start().starts_with("data:")) {
-                    let payload = data_line.trim_start()["data:".len()..].trim();
-                    if let Ok(evt) = serde_json::from_str::<Value>(payload) {
-                        let evt_type = evt.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        if evt_type == "response.output_text.delta" {
-                            chars += evt
-                                .get("delta")
-                                .and_then(|d| d.as_str())
-                                .map(|s| s.chars().count() as u64)
-                                .unwrap_or(0);
-                            stats::update_tokens_db_only(idx, stats::TokenCounts {
-                                input: 0, output: chars.div_ceil(3), cached: 0,
-                            });
-                            if let Some(h) = APP_HANDLE.get() {
-                                let _ = h.emit("stats-updated", ());
-                            }
-                        } else if evt_type == "response.completed" {
-                            if let Some(u) = evt.pointer("/response/usage") {
-                                usage.input = u.pointer("/input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-                                usage.output = u.pointer("/output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-                                usage.cached = u.pointer("/cached_tokens").and_then(|t| t.as_u64())
-                                    .or_else(|| u.pointer("/input_tokens_details/cached_tokens").and_then(|t| t.as_u64()))
-                                    .unwrap_or(0);
+        let result = tokio::time::timeout(STREAM_TIMEOUT, async {
+            match upstream_fmt {
+                UpstreamFormat::Responses => {
+                    // 原有逻辑：字节原样透传 + 统计
+                    let mut stream = byte_stream;
+                    let mut pending: Vec<u8> = Vec::new();
+                    loop {
+                        let next = match tokio::time::timeout(STREAM_TIMEOUT, stream.next()).await {
+                            Ok(Some(chunk)) => chunk, Ok(None) => break, Err(_) => break,
+                        };
+                        let Ok(bytes) = next else { break };
+                        if tx.send(Ok(bytes.to_vec())).await.is_err() { break; }
+                        pending.extend_from_slice(&bytes);
+                        while let Some(pos) = find_double_newline(&pending) {
+                            let event_bytes: Vec<u8> = pending.drain(..pos + 2).collect();
+                            let text = String::from_utf8_lossy(&event_bytes);
+                            if let Some(data_line) = text.lines().rev().find(|l| l.trim_start().starts_with("data:")) {
+                                let payload_str = data_line.trim_start()["data:".len()..].trim();
+                                if let Ok(evt) = serde_json::from_str::<Value>(payload_str) {
+                                    let evt_type = evt.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                    if evt_type == "response.output_text.delta" {
+                                        chars += evt.get("delta").and_then(|d| d.as_str()).map(|s| s.chars().count() as u64).unwrap_or(0);
+                                        stats::update_tokens_db_only(idx, stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 });
+                                        if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
+                                    } else if evt_type == "response.completed" {
+                                        if let Some(u) = evt.pointer("/response/usage") {
+                                            usage.input = u.pointer("/input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                                            usage.output = u.pointer("/output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                                            usage.cached = u.pointer("/cached_tokens").and_then(|t| t.as_u64())
+                                                .or_else(|| u.pointer("/input_tokens_details/cached_tokens").and_then(|t| t.as_u64())).unwrap_or(0);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
+                UpstreamFormat::ChatCompletions => {
+                    // 上游 Chat SSE -> Responses SSE
+                    let (c, _, u) = convert_stream_chat_to_responses(byte_stream, model.clone(), &tx, Some(Box::new(move |chars: u64| {
+                        stats::update_tokens_db_only(idx, stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 });
+                        if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
+                    }))).await;
+                    chars = c; usage = u;
+                }
+                UpstreamFormat::Anthropic => {
+                    // 上游 Anthropic SSE -> Responses SSE
+                    let (c, _, u) = convert_stream_anthropic_to_responses(byte_stream, model.clone(), &tx, Some(Box::new(move |chars: u64| {
+                        stats::update_tokens_db_only(idx, stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 });
+                        if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
+                    }))).await;
+                    chars = c; usage = u;
+                }
             }
-        }
+        }).await;
+        let _ = result; // timeout already handled inside
         drop(tx);
-        let tc = if usage.input > 0 || usage.output > 0 {
-            usage
-        } else {
-            stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 }
-        };
+        let tc = if usage.input > 0 || usage.output > 0 { usage }
+        else { stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 } };
         stats::update_last_tokens(idx, tc);
-        if let Some(h) = APP_HANDLE.get() {
-            let _ = h.emit("stats-updated", ());
-        }
+        if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
     });
 
     sse_response(rx)
@@ -1322,7 +2599,17 @@ async fn anthropic_messages(
 ) -> Response {
     let user_agent = request_user_agent(&headers);
     let wants_stream = body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
-    let payload = anthropic_to_responses_payload(&body, wants_stream);
+    let upstream_fmt = cfg().upstream_format;
+    let (payload, to_responses) = match upstream_fmt {
+        UpstreamFormat::Responses => (anthropic_to_responses_payload(&body, wants_stream), true),
+        UpstreamFormat::ChatCompletions => (anthropic_to_chat_payload(&body, wants_stream), false),
+        UpstreamFormat::Anthropic => {
+            // 直通：只替换 model_override
+            let mut b = body.clone();
+            if !cfg().model_override.is_empty() { b["model"] = json!(cfg().model_override); }
+            (b, false)
+        }
+    };
     let model = payload
         .get("model")
         .and_then(|m| m.as_str())
@@ -1343,18 +2630,41 @@ async fn anthropic_messages(
     }
 
     if !wants_stream {
-        let (cc, chars, upstream_usage) = aggregate_chat_completion(upstream, model).await;
-        let tc = if upstream_usage.input > 0 || upstream_usage.output > 0 {
-            upstream_usage
+        if to_responses {
+            // 上游返回 Responses 格式 -> 转为 Anthropic（复用现有 aggregate_chat_completion + chat_completion_to_anthropic）
+            let (cc, chars, upstream_usage) = aggregate_chat_completion(upstream, model).await;
+            let tc = if upstream_usage.input > 0 || upstream_usage.output > 0 { upstream_usage }
+            else { stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 } };
+            stats::update_tokens_db_only(guard.idx(), tc.clone());
+            guard.release();
+            if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
+            return (StatusCode::OK, Json(chat_completion_to_anthropic(&cc, &tc))).into_response();
         } else {
-            stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 }
-        };
-        stats::update_tokens_db_only(guard.idx(), tc.clone());
-        guard.release();
-        if let Some(h) = APP_HANDLE.get() {
-            let _ = h.emit("stats-updated", ());
+            // 上游返回 Chat 或 Anthropic 格式
+            let full = upstream.text().await.unwrap_or_default();
+            let upstream_val = serde_json::from_str::<Value>(&full).unwrap_or(json!({}));
+            let (anthropic_val, tc) = if upstream_fmt == UpstreamFormat::ChatCompletions {
+                let cc = upstream_val.clone();
+                let tc = stats::TokenCounts {
+                    input: cc.pointer("/usage/prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+                    output: cc.pointer("/usage/completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+                    cached: 0,
+                };
+                (chat_json_to_anthropic(&cc), tc)
+            } else {
+                // Anthropic 直通
+                let tc = stats::TokenCounts {
+                    input: upstream_val.pointer("/usage/input_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+                    output: upstream_val.pointer("/usage/output_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+                    cached: 0,
+                };
+                (upstream_val, tc)
+            };
+            stats::update_tokens_db_only(guard.idx(), tc);
+            guard.release();
+            if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
+            return (StatusCode::OK, Json(anthropic_val)).into_response();
         }
-        return (StatusCode::OK, Json(chat_completion_to_anthropic(&cc, &tc))).into_response();
     }
 
     // 流式：转换为 Anthropic SSE 事件序列，实时更新 token 数
@@ -1363,35 +2673,32 @@ async fn anthropic_messages(
     let idx = guard.disarm();
     tokio::spawn(async move {
         let cb: Box<dyn Fn(u64) + Send> = Box::new(move |chars: u64| {
-            stats::update_tokens_db_only(idx, stats::TokenCounts {
-                input: 0, output: chars.div_ceil(3), cached: 0,
-            });
-            if let Some(h) = APP_HANDLE.get() {
-                let _ = h.emit("stats-updated", ());
-            }
+            stats::update_tokens_db_only(idx, stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 });
+            if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
         });
-        let result = tokio::time::timeout(
-            STREAM_TIMEOUT,
-            convert_stream_anthropic(byte_stream, model.clone(), &tx, Some(cb)),
-        )
-        .await;
+        let result = tokio::time::timeout(STREAM_TIMEOUT, async {
+            if to_responses {
+                // 上游 Responses SSE -> Anthropic SSE（复用现有 convert_stream_anthropic）
+                convert_stream_anthropic(byte_stream, model.clone(), &tx, Some(cb)).await
+            } else if upstream_fmt == UpstreamFormat::ChatCompletions {
+                // 上游 Chat SSE -> Anthropic SSE
+                let (c, tc) = convert_stream_chat_to_anthropic(byte_stream, model.clone(), &tx, Some(cb)).await;
+                (c, tc)
+            } else {
+                // Anthropic 直通
+                let (c, tc) = passthrough_anthropic_stream(byte_stream, model.clone(), &tx, Some(cb)).await;
+                (c, tc)
+            }
+        }).await;
         let (chars, upstream_usage) = match result {
             Ok(v) => v,
-            Err(_) => {
-                eprintln!("[proxy] Anthropic 流式超时，强制释放并发槽位");
-                (0, stats::TokenCounts { input: 0, output: 0, cached: 0 })
-            }
+            Err(_) => { eprintln!("[proxy] Anthropic 流式超时"); (0, stats::TokenCounts { input: 0, output: 0, cached: 0 }) }
         };
         drop(tx);
-        let tc = if upstream_usage.input > 0 || upstream_usage.output > 0 {
-            upstream_usage
-        } else {
-            stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 }
-        };
+        let tc = if upstream_usage.input > 0 || upstream_usage.output > 0 { upstream_usage }
+        else { stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 } };
         stats::update_last_tokens(idx, tc);
-        if let Some(h) = APP_HANDLE.get() {
-            let _ = h.emit("stats-updated", ());
-        }
+        if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
     });
 
     sse_response(rx)
@@ -1447,6 +2754,7 @@ mod body_limit_tests {
             port: 0,
             upstream_url: String::new(),
             max_concurrency: 20,
+            upstream_format: UpstreamFormat::Responses,
         });
 
         let payload = json!({

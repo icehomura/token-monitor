@@ -47,7 +47,7 @@
             >
               <div class="profile-info">
                 <span class="profile-name">{{ p.name }}</span>
-                <span class="profile-detail">{{ p.upstream_url || '默认地址' }} · {{ p.model_override || '原始模型' }} · 并发{{ p.max_concurrency }}</span>
+                <span class="profile-detail">{{ p.upstream_url || '默认地址' }} · {{ formatLabel(p.upstream_format) }} · {{ p.model_override || '原始模型' }} · 并发{{ p.max_concurrency }}</span>
               </div>
               <div class="profile-actions">
                 <span v-if="p.id === activeProfileId" class="profile-active-badge">激活</span>
@@ -311,6 +311,10 @@ const closeActionOptions = [
 
 function setTheme(v) { emit('update:themeName', v) }
 
+function formatLabel(f) {
+  return { chat_completions: 'Chat', responses: 'Responses', anthropic: 'Anthropic' }[f] || 'Responses'
+}
+
 const unitToggle = computed({
   get: () => props.convertUnits,
   set: (v) => emit('update:convertUnits', v),
@@ -494,6 +498,7 @@ function addNewProfile() {
     id: '',
     name: `配置 ${profiles.value.length + 1}`,
     upstream_url: '',
+    upstream_format: 'responses',
     api_key: '',
     model_override: '',
     max_concurrency: 20,
