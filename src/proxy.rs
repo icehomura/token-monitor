@@ -30,13 +30,6 @@ impl Default for UpstreamFormat {
 }
 
 impl UpstreamFormat {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Responses => "responses",
-            Self::ChatCompletions => "chat_completions",
-            Self::Anthropic => "anthropic",
-        }
-    }
     pub fn from_str(s: &str) -> Self {
         match s {
             "chat_completions" => Self::ChatCompletions,
@@ -74,6 +67,66 @@ static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 static CONFIG: std::sync::RwLock<Option<ProxyConfig>> = std::sync::RwLock::new(None);
 static SCHEDULER: OnceLock<crate::scheduler::Scheduler> = OnceLock::new();
 
+/// 单个调度渠道的上游凭据。
+///
+/// 动态调度下每个渠道各有自己的地址 / 密钥 / 上游格式 / 模型覆盖，
+/// 请求必须按调度结果取用对应渠道的这一组值，不能再用全局 `cfg()`
+/// （全局仅保留端口，以及探针 / 余额所需的默认上游）。
+#[derive(Debug, Clone)]
+pub struct ChannelConfig {
+    pub api_key: String,
+    pub upstream_url: String,
+    pub upstream_format: UpstreamFormat,
+    pub model_override: String,
+}
+
+/// profile_id -> 渠道凭据，与调度器中的渠道一一对应。
+static CHANNEL_CONFIGS: OnceLock<std::sync::RwLock<std::collections::HashMap<String, ChannelConfig>>> =
+    OnceLock::new();
+
+fn channel_configs() -> &'static std::sync::RwLock<std::collections::HashMap<String, ChannelConfig>> {
+    CHANNEL_CONFIGS.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+/// 注册或更新渠道凭据（启动时与保存 profile 时调用）
+pub fn set_channel_config(profile_id: &str, cfg: ChannelConfig) {
+    channel_configs()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(profile_id.to_string(), cfg);
+}
+
+/// 移除渠道凭据（删除 profile 时调用）
+pub fn remove_channel_config(profile_id: &str) {
+    channel_configs()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(profile_id);
+}
+
+/// 按 profile_id 取渠道凭据；未注册时返回 None
+pub fn channel_config(profile_id: &str) -> Option<ChannelConfig> {
+    channel_configs()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(profile_id)
+        .cloned()
+}
+
+/// 取渠道凭据；profile_id 为空或未注册时降级为全局配置
+fn resolve_channel(profile_id: &str) -> ChannelConfig {
+    if let Some(c) = channel_config(profile_id) {
+        return c;
+    }
+    let g = cfg();
+    ChannelConfig {
+        api_key: g.api_key,
+        upstream_url: g.upstream_url,
+        upstream_format: g.upstream_format,
+        model_override: g.model_override,
+    }
+}
+
 struct ServerHandle {
     shutdown: tokio::sync::watch::Sender<bool>,
     _join: tauri::async_runtime::JoinHandle<()>,
@@ -90,7 +143,16 @@ const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 pub fn init(handle: tauri::AppHandle, cfg: ProxyConfig) {
     let _ = APP_HANDLE.set(handle);
     *CONFIG.write().unwrap_or_else(|e| e.into_inner()) = Some(cfg);
-    let _ = SCHEDULER.set(crate::scheduler::Scheduler::new());
+    init_scheduler();
+}
+
+/// 初始化调度器单例（幂等）。
+///
+/// 与 `init` 分开是为了让调度器不依赖 AppHandle：
+/// 渠道由 `main` 通过 `scheduler().upsert_channel(...)` 写入，
+/// 请求路径读的是同一个实例。
+pub fn init_scheduler() -> &'static crate::scheduler::Scheduler {
+    SCHEDULER.get_or_init(crate::scheduler::Scheduler::new)
 }
 
 pub fn cfg() -> ProxyConfig {
@@ -101,37 +163,34 @@ pub fn cfg() -> ProxyConfig {
         .expect("proxy config not initialized")
 }
 
-/// 运行时热更新 Key / 模型名 / 上游地址 / 并发数，立即对后续请求生效，无需重启服务
-pub fn update_runtime(
-    api_key: Option<String>,
-    model_override: Option<String>,
-    upstream_url: Option<String>,
-    max_concurrency: Option<usize>,
-    upstream_format: Option<UpstreamFormat>,
-) {
-    let mut c = CONFIG.write().unwrap_or_else(|e| e.into_inner());
-    if let Some(c) = c.as_mut() {
-        if let Some(k) = api_key {
-            c.api_key = k;
-        }
-        if let Some(m) = model_override {
-            c.model_override = m;
-        }
-        if let Some(u) = upstream_url {
-            c.upstream_url = u;
-        }
-        if let Some(mc) = max_concurrency {
-            c.max_concurrency = mc;
-        }
-        if let Some(f) = upstream_format {
-            c.upstream_format = f;
-        }
-    }
+/// 探针 / 余额使用的上游地址：取第一个已启用渠道。
+pub fn upstream_url() -> String {
+    probe_channel().upstream_url.trim().to_string()
 }
 
-/// 当前实际使用的上游地址（空配置时返回空字符串）
-pub fn upstream_url() -> String {
-    cfg().upstream_url.trim().to_string()
+/// 探针 / 余额使用的 API Key，口径同 `upstream_url()`
+pub fn default_api_key() -> String {
+    probe_channel().api_key
+}
+
+/// 探针 / 余额使用的渠道凭据：取首个启用渠道，无启用渠道时回退全局配置。
+///
+/// 动态调度下不存在单一「当前上游」，用首个启用渠道代表整体可用性；
+/// 回退分支同时覆盖调度器尚未初始化的启动早期场景。
+pub fn probe_channel() -> ChannelConfig {
+    let from_scheduler = SCHEDULER
+        .get()
+        .and_then(|s| s.first_enabled_id())
+        .and_then(|id| channel_config(&id));
+    from_scheduler.unwrap_or_else(|| {
+        let g = cfg();
+        ChannelConfig {
+            api_key: g.api_key,
+            upstream_url: g.upstream_url,
+            upstream_format: g.upstream_format,
+            model_override: g.model_override,
+        }
+    })
 }
 
 /// 获取 AppHandle（供 main.rs 调用事件通知）
@@ -298,7 +357,7 @@ fn convert_messages(messages: &Value) -> Vec<Value> {
     items
 }
 
-fn chat_to_responses_payload(chat_body: &Value, stream: bool) -> Value {
+fn chat_to_responses_payload(chat_body: &Value, stream: bool, model_override: &str) -> Value {
     let mut payload = json!({
         "input": convert_messages(chat_body.get("messages").unwrap_or(&Value::Null)),
         "stream": stream,
@@ -327,8 +386,8 @@ fn chat_to_responses_payload(chat_body: &Value, stream: bool) -> Value {
         Some(other) => payload["reasoning_effort"] = json!(other),
         None => {}
     }
-    if !cfg().model_override.is_empty() {
-        payload["model"] = json!(cfg().model_override);
+    if !model_override.is_empty() {
+        payload["model"] = json!(model_override);
     }
     payload
 }
@@ -380,7 +439,7 @@ fn anthropic_message_item(role: &str, text: &str) -> Value {
 /// - image 块（base64 源）-> input_image（data URL）
 /// - assistant 的 tool_use 块 -> function_call 项
 /// - user 的 tool_result 块 -> function_call_output 项
-fn anthropic_to_responses_payload(body: &Value, stream: bool) -> Value {
+fn anthropic_to_responses_payload(body: &Value, stream: bool, model_override: &str) -> Value {
     let mut items: Vec<Value> = Vec::new();
 
     if let Some(sys) = body.get("system") {
@@ -475,8 +534,8 @@ fn anthropic_to_responses_payload(body: &Value, stream: bool) -> Value {
     if let Some(mt) = body.get("max_tokens") {
         payload["max_output_tokens"] = mt.clone();
     }
-    if !cfg().model_override.is_empty() {
-        payload["model"] = json!(cfg().model_override);
+    if !model_override.is_empty() {
+        payload["model"] = json!(model_override);
     }
     payload
 }
@@ -558,7 +617,7 @@ fn responses_tools_to_chat(tools: Option<&Value>) -> Option<Value> {
 }
 
 /// Responses API -> Chat Completions payload
-fn responses_to_chat_payload(body: &Value, stream: bool) -> Value {
+fn responses_to_chat_payload(body: &Value, stream: bool, model_override: &str) -> Value {
     let messages = match body.get("input").and_then(|i| i.as_array()) {
         Some(items) => responses_items_to_chat_messages(items),
         None => vec![],
@@ -581,8 +640,8 @@ fn responses_to_chat_payload(body: &Value, stream: bool) -> Value {
     if let Some(mt) = body.get("max_output_tokens") {
         payload["max_tokens"] = mt.clone();
     }
-    if !cfg().model_override.is_empty() {
-        payload["model"] = json!(cfg().model_override);
+    if !model_override.is_empty() {
+        payload["model"] = json!(model_override);
     }
     payload
 }
@@ -608,7 +667,7 @@ fn chat_tools_to_anthropic(tools: Option<&Value>) -> Option<Value> {
 }
 
 /// Chat Completions -> Anthropic Messages payload
-fn chat_to_anthropic_payload(body: &Value, stream: bool) -> Value {
+fn chat_to_anthropic_payload(body: &Value, stream: bool, model_override: &str) -> Value {
     let mut system_text = String::new();
     let mut messages = Vec::new();
 
@@ -722,8 +781,8 @@ fn chat_to_anthropic_payload(body: &Value, stream: bool) -> Value {
     if let Some(mt) = body.get("max_tokens").or_else(|| body.get("max_completion_tokens")) {
         payload["max_tokens"] = mt.clone();
     }
-    if !cfg().model_override.is_empty() {
-        payload["model"] = json!(cfg().model_override);
+    if !model_override.is_empty() {
+        payload["model"] = json!(model_override);
     }
     payload
 }
@@ -751,7 +810,7 @@ fn anthropic_tools_to_chat(tools: Option<&Value>) -> Option<Value> {
 }
 
 /// Anthropic Messages -> Chat Completions payload
-fn anthropic_to_chat_payload(body: &Value, stream: bool) -> Value {
+fn anthropic_to_chat_payload(body: &Value, stream: bool, model_override: &str) -> Value {
     let mut messages = Vec::new();
 
     // system 顶级字段 -> system message
@@ -858,8 +917,8 @@ fn anthropic_to_chat_payload(body: &Value, stream: bool) -> Value {
     if let Some(mt) = body.get("max_tokens") {
         payload["max_tokens"] = mt.clone();
     }
-    if !cfg().model_override.is_empty() {
-        payload["model"] = json!(cfg().model_override);
+    if !model_override.is_empty() {
+        payload["model"] = json!(model_override);
     }
     payload
 }
@@ -867,7 +926,7 @@ fn anthropic_to_chat_payload(body: &Value, stream: bool) -> Value {
 // ---------- 参数转换：Responses API -> Anthropic Messages ----------
 
 /// Responses API -> Anthropic Messages payload
-fn responses_to_anthropic_payload(body: &Value, stream: bool) -> Value {
+fn responses_to_anthropic_payload(body: &Value, stream: bool, model_override: &str) -> Value {
     let mut system_text = String::new();
     let mut messages = Vec::new();
 
@@ -963,8 +1022,8 @@ fn responses_to_anthropic_payload(body: &Value, stream: bool) -> Value {
     if let Some(mt) = body.get("max_output_tokens") {
         payload["max_tokens"] = mt.clone();
     }
-    if !cfg().model_override.is_empty() {
-        payload["model"] = json!(cfg().model_override);
+    if !model_override.is_empty() {
+        payload["model"] = json!(model_override);
     }
     payload
 }
@@ -2050,92 +2109,96 @@ pub(crate) async fn acquire_slot() -> Option<stats::SlotGuard> {
     None
 }
 
-/// 软并发调度：使用配置中的 max_concurrency，超过时先等待。
-/// 最长等待 120 秒；超时后返回 429。
-/// 返回 (SlotGuard, profile_id)：profile_id 用于调度器的请求完成追踪。
+/// 构造 429 响应
+fn too_many_requests(message: String) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({"error": {"message": message, "type": "concurrency_limit_exceeded"}})),
+    )
+        .into_response()
+}
+
+/// 软并发调度：先由调度器选出可用渠道，再获取全局并发槽位与渠道并发槽位。
+/// 最长等待 120 秒；超时返回 429。
+/// 返回 (SlotGuard, profile_id)，profile_id 供调用方取该渠道的上游凭据。
 async fn wait_for_slot() -> Result<(stats::SlotGuard, String), Response> {
-    // 尝试通过调度器选择最优渠道
-    if let Some(sched) = SCHEDULER.get() {
+    // 调度器未初始化：降级为全局并发控制
+    let Some(sched) = SCHEDULER.get() else {
+        return match acquire_slot().await {
+            Some(g) => Ok((g, String::new())),
+            None => Err(too_many_requests(format!(
+                "并发请求已达上限（{MAX_CONCURRENCY}），排队等待 2 分钟仍未获取到槽位，请稍后重试"
+            ))),
+        };
+    };
+
+    // 全局闸门取「已启用渠道并发之和」，否则大并发渠道会被小渠道上限卡住
+    let max = sched.total_concurrency().max(1);
+    let mut waited = false;
+
+    for _ in 0..600 {
+        // 每轮重新选路，渠道释放后能重新被选中，而不是锁定首次选择
         if let Some(profile_id) = sched.select_channel() {
-            let max = cfg().max_concurrency;
-            let mut waited = false;
-            for _ in 0..600 {
-                // 全局并发槽位
-                if let Some(id) = stats::try_acquire(max as u64) {
-                    if waited {
-                        println!("[proxy] 并发达到上限，已等待排空；当前并发 {}", stats::active());
-                    }
-                    if let Some(h) = APP_HANDLE.get() {
-                        let _ = h.emit("stats-updated", ());
-                    }
-                    // 渠道并发槽位
-                    if sched.acquire_slot(&profile_id) {
-                        return Ok((stats::SlotGuard::new(id), profile_id));
-                    }
-                    // 渠道已满，释放全局槽位继续等待（drop SlotGuard 触发 ACTIVE -1）
-                    drop(stats::SlotGuard::new(id));
+            if let Some(id) = stats::try_acquire(max as u64) {
+                if waited {
+                    println!("[proxy] 并发达到上限，已等待排空；当前并发 {}", stats::active());
                 }
-                waited = true;
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if let Some(h) = APP_HANDLE.get() {
+                    let _ = h.emit("stats-updated", ());
+                }
+                if sched.acquire_slot(&profile_id) {
+                    return Ok((stats::SlotGuard::new(id), profile_id));
+                }
+                // 渠道已满，释放全局槽位后继续等待（drop 触发 ACTIVE -1）
+                drop(stats::SlotGuard::new(id));
             }
-            eprintln!(
-                "[proxy] 并发持续占满 {}（当前 {}），等待 120s 超时",
-                max,
-                stats::active()
-            );
+        } else if !sched.has_enabled_channel() {
+            // 无任何启用渠道：继续等待也不会好转，立即返回明确错误
             return Err((
-                StatusCode::TOO_MANY_REQUESTS,
+                StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
                     "error": {
-                        "message": format!("并发请求已达上限（{}），排队等待 2 分钟仍未获取到槽位，请稍后重试", MAX_CONCURRENCY),
-                        "type": "concurrency_limit_exceeded",
+                        "message": "所有渠道均已禁用：请在设置中至少开启一个渠道参与调度",
+                        "type": "no_enabled_channel",
                     }
                 })),
             )
                 .into_response());
         }
-        // 所有渠道都满了
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({
-                "error": {
-                    "message": "所有渠道均已达到并发上限，请稍后重试",
-                    "type": "channel_limit_exceeded",
-                }
-            })),
-        )
-            .into_response());
+        waited = true;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    // 调度器未初始化时降级到原有逻辑
-    match acquire_slot().await {
-        Some(g) => Ok((g, String::new())),
-        None => Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({
-                "error": {
-                    "message": format!("并发请求已达上限（{}），排队等待 2 分钟仍未获取到槽位，请稍后重试", MAX_CONCURRENCY),
-                    "type": "concurrency_limit_exceeded",
-                }
-            })),
-        )
-            .into_response()),
-    }
+
+    eprintln!(
+        "[proxy] 所有渠道并发持续占满（当前 {}），等待 120s 超时",
+        stats::active()
+    );
+    Err(too_many_requests(
+        "所有渠道并发均已占满，排队等待 2 分钟仍未获取到槽位，请稍后重试".to_string(),
+    ))
 }
 
-async fn send_upstream(payload: &Value, user_agent: &str) -> Result<reqwest::Response, (StatusCode, Value)> {
+async fn send_upstream(
+    payload: &Value,
+    user_agent: &str,
+    ch: &ChannelConfig,
+) -> Result<reqwest::Response, (StatusCode, Value)> {
+    let api_key = ch.api_key.trim();
+    let url = ch.upstream_url.trim();
+
     // 空 Key 直接拒绝，避免打到上游才收到难懂的 401
-    if cfg().api_key.trim().is_empty() {
+    if api_key.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            json!({"error": {"message": "API Key 未配置：请在设置面板填写，或写入 token-monitor.json 的 api_key 字段", "type": "proxy_config_error"}}),
+            json!({"error": {"message": "渠道 API Key 未配置：请在设置面板的该渠道中填写", "type": "proxy_config_error"}}),
         ));
     }
 
     // 空上游地址拒绝
-    if upstream_url().is_empty() {
+    if url.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            json!({"error": {"message": "转发目标地址未配置：请在设置面板填写，或写入 token-monitor.json 的 upstream_url 字段", "type": "proxy_config_error"}}),
+            json!({"error": {"message": "渠道转发目标地址未配置：请在设置面板的该渠道中填写", "type": "proxy_config_error"}}),
         ));
     }
 
@@ -2154,8 +2217,8 @@ async fn send_upstream(payload: &Value, user_agent: &str) -> Result<reqwest::Res
     let mut last_status = StatusCode::BAD_GATEWAY;
     for attempt in 0..MAX_RETRIES {
         let resp = client
-            .post(upstream_url())
-            .bearer_auth(cfg().api_key.trim())
+            .post(url)
+            .bearer_auth(api_key)
             // 与参考实现一致：accept 固定 text/event-stream（网关据此决定是否流式返回），
             // 并转发客户端 user-agent
             .header("accept", "text/event-stream")
@@ -2366,14 +2429,23 @@ async fn chat_completions(
 ) -> Response {
     let user_agent = request_user_agent(&headers);
     let wants_stream = chat_body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
-    let upstream_fmt = cfg().upstream_format;
+
+    // 先选路：渠道的上游格式决定载荷如何转换，必须早于 payload 构造
+    let (guard, profile_id) = match wait_for_slot().await {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    let _profile_id_for_stream = profile_id.clone();
+    let ch = resolve_channel(&profile_id);
+    let upstream_fmt = ch.upstream_format;
+
     let (payload, to_responses) = match upstream_fmt {
-        UpstreamFormat::Responses => (chat_to_responses_payload(&chat_body, wants_stream), true),
-        UpstreamFormat::Anthropic => (chat_to_anthropic_payload(&chat_body, wants_stream), false),
+        UpstreamFormat::Responses => (chat_to_responses_payload(&chat_body, wants_stream, &ch.model_override), true),
+        UpstreamFormat::Anthropic => (chat_to_anthropic_payload(&chat_body, wants_stream, &ch.model_override), false),
         UpstreamFormat::ChatCompletions => {
             // 直通：只替换 model_override
             let mut b = chat_body.clone();
-            if !cfg().model_override.is_empty() { b["model"] = json!(cfg().model_override); }
+            if !ch.model_override.is_empty() { b["model"] = json!(ch.model_override); }
             (b, false)
         }
     };
@@ -2383,14 +2455,7 @@ async fn chat_completions(
         .unwrap_or("")
         .to_string();
 
-    // 排队获取并发槽位（超时 120s 返回 429）
-    let (guard, profile_id) = match wait_for_slot().await {
-        Ok(g) => g,
-        Err(resp) => return resp,
-    };
-    let _profile_id_for_stream = profile_id.clone();
-
-    let upstream = match send_upstream(&payload, &user_agent).await {
+    let upstream = match send_upstream(&payload, &user_agent, &ch).await {
         Ok(r) => r,
         Err((status, body)) => return (status, Json(body)).into_response(),
     };
@@ -2515,26 +2580,26 @@ async fn responses_api(
 ) -> Response {
     let user_agent = request_user_agent(&headers);
     let wants_stream = body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
-    // 强制模型名仍然生效
-    if !cfg().model_override.is_empty() {
-        body["model"] = json!(cfg().model_override);
-    }
 
     let (guard, profile_id) = match wait_for_slot().await {
         Ok(g) => g,
         Err(resp) => return resp,
     };
+    let ch = resolve_channel(&profile_id);
+    let upstream_fmt = ch.upstream_format;
 
-    // 按上游格式转换请求
-    let upstream_fmt = cfg().upstream_format;
+    // 按上游格式转换请求；模型强制覆盖取自选中渠道
+    if !ch.model_override.is_empty() {
+        body["model"] = json!(ch.model_override);
+    }
     let body = match upstream_fmt {
         UpstreamFormat::Responses => body,  // 直通
-        UpstreamFormat::ChatCompletions => responses_to_chat_payload(&body, wants_stream),
-        UpstreamFormat::Anthropic => responses_to_anthropic_payload(&body, wants_stream),
+        UpstreamFormat::ChatCompletions => responses_to_chat_payload(&body, wants_stream, &ch.model_override),
+        UpstreamFormat::Anthropic => responses_to_anthropic_payload(&body, wants_stream, &ch.model_override),
     };
     let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
 
-    let upstream = match send_upstream(&body, &user_agent).await {
+    let upstream = match send_upstream(&body, &user_agent, &ch).await {
         Ok(r) => r,
         Err((status, err)) => return (status, Json(err)).into_response(),
     };
@@ -2668,14 +2733,22 @@ async fn anthropic_messages(
 ) -> Response {
     let user_agent = request_user_agent(&headers);
     let wants_stream = body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
-    let upstream_fmt = cfg().upstream_format;
+
+    // 先选路：渠道的上游格式决定载荷如何转换，必须早于 payload 构造
+    let (guard, profile_id) = match wait_for_slot().await {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    let ch = resolve_channel(&profile_id);
+    let upstream_fmt = ch.upstream_format;
+
     let (payload, to_responses) = match upstream_fmt {
-        UpstreamFormat::Responses => (anthropic_to_responses_payload(&body, wants_stream), true),
-        UpstreamFormat::ChatCompletions => (anthropic_to_chat_payload(&body, wants_stream), false),
+        UpstreamFormat::Responses => (anthropic_to_responses_payload(&body, wants_stream, &ch.model_override), true),
+        UpstreamFormat::ChatCompletions => (anthropic_to_chat_payload(&body, wants_stream, &ch.model_override), false),
         UpstreamFormat::Anthropic => {
             // 直通：只替换 model_override
             let mut b = body.clone();
-            if !cfg().model_override.is_empty() { b["model"] = json!(cfg().model_override); }
+            if !ch.model_override.is_empty() { b["model"] = json!(ch.model_override); }
             (b, false)
         }
     };
@@ -2685,11 +2758,7 @@ async fn anthropic_messages(
         .unwrap_or("")
         .to_string();
 
-    let (guard, profile_id) = match wait_for_slot().await {
-        Ok(g) => g,
-        Err(resp) => return resp,
-    };
-    let upstream = match send_upstream(&payload, &user_agent).await {
+    let upstream = match send_upstream(&payload, &user_agent, &ch).await {
         Ok(r) => r,
         Err((status, err)) => return (status, Json(err)).into_response(),
     };
@@ -2809,6 +2878,89 @@ fn build_router() -> Router<()> {
         .layer(cors)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(())
+}
+
+#[cfg(test)]
+mod channel_routing_tests {
+    use super::*;
+
+    /// 回归保护：修复前请求路径读的是一个「空调度器」实例，
+    /// `select_channel()` 恒为 None，于是所有请求一律 429。
+    /// 这里验证注册渠道后调度器确实能选出渠道，且能解析出对应上游凭据。
+    #[test]
+    fn registered_channel_is_selectable_and_resolvable() {
+        let sched = init_scheduler();
+
+        // ch1 禁用、ch2 启用
+        sched.upsert_channel("ch1", false, 20, 0, 0, 100);
+        sched.upsert_channel("ch2", true, 30, 0, 0, 100);
+        set_channel_config(
+            "ch2",
+            ChannelConfig {
+                api_key: "sk-ch2".into(),
+                upstream_url: "https://ch2.example.com/v1/responses".into(),
+                upstream_format: UpstreamFormat::Anthropic,
+                model_override: "m-ch2".into(),
+            },
+        );
+
+        // 仅 ch2 启用 → 必须选中 ch2 而不是 None（None 会让请求直接 429）
+        let picked = sched.select_channel();
+        assert_eq!(picked.as_deref(), Some("ch2"), "启用渠道未被选中，请求会直接 429");
+
+        // 凭据必须解析到选中渠道自身，而不是全局配置
+        let ch = resolve_channel("ch2");
+        assert_eq!(ch.api_key, "sk-ch2");
+        assert_eq!(ch.upstream_url, "https://ch2.example.com/v1/responses");
+        assert_eq!(ch.upstream_format, UpstreamFormat::Anthropic);
+        assert_eq!(ch.model_override, "m-ch2");
+
+        // 未注册的 id 不产生凭据。
+        // 这里只断言 channel_config 的查找结果，不走 resolve_channel 的
+        // 「回退全局配置」分支——那条分支读进程级 CONFIG，会与其它测试相互干扰。
+        assert!(channel_config("no-such-channel").is_none());
+    }
+
+    /// 回归保护：「全禁用」必须与「全满」区分开。
+    /// 前者继续等待也不会好转，应立即报错；旧实现一律当成后者并静默返回 429。
+    #[test]
+    fn all_disabled_is_distinguishable_from_all_busy() {
+        let s = crate::scheduler::Scheduler::new();
+        s.upsert_channel("a", false, 10, 0, 0, 100);
+        s.upsert_channel("b", false, 10, 0, 0, 100);
+
+        assert_eq!(s.select_channel(), None);
+        assert!(
+            !s.has_enabled_channel(),
+            "全禁用必须能被识别，否则会被误判为「已满」并让请求白等 2 分钟"
+        );
+
+        // 启用一个之后，就应该能选出来
+        s.upsert_channel("b", true, 10, 0, 0, 100);
+        assert!(s.has_enabled_channel());
+        assert_eq!(s.select_channel().as_deref(), Some("b"));
+    }
+
+    /// 渠道凭据按 profile_id 隔离，互不串用
+    #[test]
+    fn channel_configs_are_isolated_per_profile() {
+        let mk = |key: &str, url: &str| ChannelConfig {
+            api_key: key.into(),
+            upstream_url: url.into(),
+            upstream_format: UpstreamFormat::Responses,
+            model_override: String::new(),
+        };
+        set_channel_config("iso-a", mk("sk-a", "https://a.example.com"));
+        set_channel_config("iso-b", mk("sk-b", "https://b.example.com"));
+
+        assert_eq!(resolve_channel("iso-a").api_key, "sk-a");
+        assert_eq!(resolve_channel("iso-b").upstream_url, "https://b.example.com");
+
+        // 移除后凭据应消失，请求不再可能路由到已删除的渠道
+        remove_channel_config("iso-a");
+        assert!(channel_config("iso-a").is_none());
+        assert_eq!(channel_config("iso-b").map(|c| c.api_key), Some("sk-b".into()));
+    }
 }
 
 #[cfg(test)]

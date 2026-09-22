@@ -222,5 +222,5 @@ jobs:
             artifacts/linux-x86_64/**/*.deb
             artifacts/linux-aarch64/**/*.AppImage
             artifacts/linux-aarch64/**/*.deb
-          draft: true
+          draft: false
           generate_release_notes: true

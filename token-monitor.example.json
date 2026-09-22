@@ -32,7 +32,6 @@
       "weight": 50
     }
   ],
-  "active_profile_id": "example-1",
   "balance": {
     "enabled": false,
     "currency": "CNY",

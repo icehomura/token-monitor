@@ -64,21 +64,47 @@ impl Default for Profile {
     }
 }
 
-use std::sync::OnceLock;
-
 fn uuid_simple() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     format!("{:x}-{:04x}", t.as_secs(), t.subsec_nanos() & 0xFFFF)
 }
 
-// ──────── 全局调度器 ────────
+// ──────── 渠道注册 ────────
 
-static SCHEDULER: OnceLock<scheduler::Scheduler> = OnceLock::new();
+/// 把渠道注册 / 更新到调度器与渠道凭据表。
+///
+/// 调度器与凭据表都由 proxy 持有（请求路径读的是同一份），
+/// main 侧只负责在启动与保存 profile 时写入，
+/// 避免出现两个互不相通的实例导致请求侧拿到空的调度器。
+fn register_profile(p: &Profile) {
+    if let Some(sched) = proxy::scheduler() {
+        sched.upsert_channel(
+            &p.id,
+            p.enabled,
+            p.max_concurrency,
+            p.max_rpm,
+            p.max_tpm,
+            p.weight,
+        );
+    }
+    proxy::set_channel_config(
+        &p.id,
+        proxy::ChannelConfig {
+            api_key: p.api_key.clone(),
+            upstream_url: p.upstream_url.clone(),
+            upstream_format: UpstreamFormat::from_str(&p.upstream_format),
+            model_override: p.model_override.clone(),
+        },
+    );
+}
 
-/// 获取全局调度器实例（在 setup 阶段初始化后可用）
-pub(crate) fn scheduler() -> Option<&'static scheduler::Scheduler> {
-    SCHEDULER.get()
+/// 从调度器与凭据表移除渠道
+fn unregister_profile(id: &str) {
+    if let Some(sched) = proxy::scheduler() {
+        sched.remove_channel(id);
+    }
+    proxy::remove_channel_config(id);
 }
 
 #[derive(Serialize)]
@@ -127,16 +153,18 @@ fn get_stats(window_minutes: i32, start_ms: Option<i64>, end_ms: Option<i64>) ->
 
 #[tauri::command]
 fn get_server_info() -> serde_json::Value {
-    let c = proxy::cfg();
+    let port = proxy::cfg().port;
+    // 动态调度下不存在单一强制模型，用首个启用渠道的模型名供前端提示与测试请求使用
+    let model_override = proxy::probe_channel().model_override;
     serde_json::json!({
-        "port": c.port,
-        "endpoint": format!("http://127.0.0.1:{}/v1", c.port),
+        "port": port,
+        "endpoint": format!("http://127.0.0.1:{port}/v1"),
         "endpoints": [
             "/v1/chat/completions",
             "/v1/responses",
             "/v1/messages",
         ],
-        "model_override": c.model_override,
+        "model_override": model_override,
     })
 }
 
@@ -188,47 +216,10 @@ fn save_port(port: u16) -> Result<(), String> {
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     v["port"] = json!(port);
-    if v.get("api_key").is_none() {
-        v["api_key"] = json!(proxy::cfg().api_key);
-    }
     std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap())
         .map_err(|e| format!("写入配置失败：{e}"))?;
     println!("saved port {} to {}", port, path.display());
     Ok(())
-}
-
-/// 保存模型名与 API Key：写入配置文件并立即热更新运行时（无需重启服务）
-#[tauri::command]
-fn set_model_config(api_key: String, model_override: String) -> Result<serde_json::Value, String> {
-    let path = config_path().ok_or("无法确定配置文件路径")?;
-    let mut v: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-
-    let key_trimmed = api_key.trim().to_string();
-    let model_trimmed = model_override.trim().to_string();
-    if !key_trimmed.is_empty() {
-        v["api_key"] = json!(key_trimmed);
-    }
-    v["model_override"] = json!(model_trimmed); // 空字符串 = 不覆盖，用请求原始 model
-    std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap())
-        .map_err(|e| format!("写入配置失败：{e}"))?;
-
-    // 热更新运行时配置（后续请求立即生效）
-    proxy::update_runtime(
-        (!key_trimmed.is_empty()).then_some(key_trimmed.clone()),
-        Some(model_trimmed.clone()),
-        None,
-        None,
-        None,
-    );
-
-    println!("saved model config to {}", path.display());
-    if let Some(handle) = proxy::app_handle() {
-        let _ = handle.emit("server-info-changed", ());
-    }
-    Ok(serde_json::json!({"model_override": model_trimmed, "has_api_key": !key_trimmed.is_empty()}))
 }
 
 #[derive(serde::Serialize)]
@@ -280,51 +271,21 @@ async fn codeg_session_action(
 #[derive(Serialize)]
 struct SettingsInfo {
     port: u16,
-    model_override: String,
-    has_api_key: bool,
-    upstream_url: String,
-    max_concurrency: usize,
-    active_profile_id: String,
-    upstream_format: String,
+    channel_count: usize,
+    enabled_count: usize,
+    total_concurrency: usize,
 }
 
 #[tauri::command]
 fn get_settings() -> SettingsInfo {
-    let c = proxy::cfg();
-    let active_id = read_saved_config_str("active_profile_id");
+    let profiles = read_profiles_from_config();
+    let enabled: Vec<&Profile> = profiles.iter().filter(|p| p.enabled).collect();
     SettingsInfo {
-        port: c.port,
-        model_override: c.model_override.clone(),
-        has_api_key: !c.api_key.is_empty(),
-        upstream_url: proxy::upstream_url(),
-        max_concurrency: c.max_concurrency,
-        active_profile_id: active_id,
-        upstream_format: c.upstream_format.as_str().to_string(),
+        port: proxy::cfg().port,
+        channel_count: profiles.len(),
+        enabled_count: enabled.len(),
+        total_concurrency: enabled.iter().map(|p| p.max_concurrency).sum(),
     }
-}
-
-/// 保存转发目标地址并立即热更新（无需重启服务）
-#[tauri::command]
-fn set_upstream(url: String) -> Result<serde_json::Value, String> {
-    let url = url.trim().to_string();
-    if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err("地址必须以 http:// 或 https:// 开头".into());
-    }
-    let path = config_path().ok_or("无法确定配置文件路径")?;
-    let mut v: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    v["upstream_url"] = json!(url); // 空字符串 = 恢复默认地址
-    std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap())
-        .map_err(|e| format!("写入配置失败：{e}"))?;
-
-    proxy::update_runtime(None, None, Some(url.clone()), None, None);
-    println!("saved upstream url to {}", path.display());
-    if let Some(handle) = proxy::app_handle() {
-        let _ = handle.emit("server-info-changed", ());
-    }
-    Ok(serde_json::json!({"upstream_url": if url.is_empty() { proxy::upstream_url() } else { url }}))
 }
 
 /// 保存新端口并重启代理服务（重新监听）
@@ -389,34 +350,22 @@ fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
 
 // ──────── Profile 管理 ────────
 
-fn read_profiles_from_config() -> (Vec<Profile>, String) {
-    let path = match config_path() {
-        Some(p) => p,
-        None => return (vec![], String::new()),
-    };
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(_) => return (vec![], String::new()),
-    };
+fn read_profiles_from_config() -> Vec<Profile> {
+    let Some(path) = config_path() else { return vec![] };
+    let Ok(text) = std::fs::read_to_string(&path) else { return vec![] };
     let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(json!({}));
-    let profiles: Vec<Profile> = v.get("profiles")
+    v.get("profiles")
         .and_then(|p| serde_json::from_value(p.clone()).ok())
-        .unwrap_or_default();
-    let active_id = v.get("active_profile_id")
-        .and_then(|p| p.as_str())
-        .unwrap_or("")
-        .to_string();
-    (profiles, active_id)
+        .unwrap_or_default()
 }
 
-fn write_profiles_to_config(profiles: &[Profile], active_id: &str) -> Result<(), String> {
+fn write_profiles_to_config(profiles: &[Profile]) -> Result<(), String> {
     let path = config_path().ok_or("无法确定配置文件路径")?;
     let mut v: serde_json::Value = std::fs::read_to_string(&path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_else(|| json!({}));
     v["profiles"] = serde_json::to_value(profiles).unwrap_or(json!([]));
-    v["active_profile_id"] = json!(active_id);
     std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap())
         .map_err(|e| format!("写入配置失败：{e}"))
 }
@@ -424,135 +373,42 @@ fn write_profiles_to_config(profiles: &[Profile], active_id: &str) -> Result<(),
 /// 获取所有配置文件
 #[tauri::command]
 fn get_profiles() -> serde_json::Value {
-    let (profiles, active_id) = read_profiles_from_config();
-    serde_json::json!({
-        "profiles": profiles,
-        "active_profile_id": active_id,
-    })
+    serde_json::json!({ "profiles": read_profiles_from_config() })
 }
 
 /// 保存配置文件（新增或更新）
 #[tauri::command]
 fn save_profile(profile: Profile) -> Result<serde_json::Value, String> {
-    let (mut profiles, active_id) = read_profiles_from_config();
-    let is_active = profile.id == active_id;
+    let mut profiles = read_profiles_from_config();
     if let Some(existing) = profiles.iter_mut().find(|p| p.id == profile.id) {
         *existing = profile.clone();
     } else {
         profiles.push(profile.clone());
     }
-    write_profiles_to_config(&profiles, &active_id)?;
-    // 如果保存的是当前激活的配置，立即应用到运行时
-    if is_active {
-        apply_profile(&profile)?;
-    }
+    write_profiles_to_config(&profiles)?;
+    // 渠道配置立即热更新（并发 / RPM / TPM / 权重 / 上游凭据），无需重启
+    register_profile(&profile);
     Ok(serde_json::json!({ "profile": profile, "profiles": profiles }))
 }
 
 /// 删除配置文件
 #[tauri::command]
 fn delete_profile(id: String) -> Result<serde_json::Value, String> {
-    let (mut profiles, active_id) = read_profiles_from_config();
+    let mut profiles = read_profiles_from_config();
     profiles.retain(|p| p.id != id);
-    let new_active = if active_id == id {
-        profiles.first().map(|p| p.id.clone()).unwrap_or_default()
-    } else {
-        active_id.clone()
-    };
-    write_profiles_to_config(&profiles, &new_active)?;
-    // 如果删除的是当前激活的，切换到新的
-    if active_id == id {
-        if let Some(p) = profiles.first() {
-            apply_profile(p)?;
-        }
-    }
-    Ok(serde_json::json!({ "profiles": profiles, "active_profile_id": new_active }))
-}
-
-/// 切换激活的配置文件并立即生效
-#[tauri::command]
-fn set_active_profile(id: String) -> Result<serde_json::Value, String> {
-    let (profiles, _old_id) = read_profiles_from_config();
-    let profile = profiles.iter().find(|p| p.id == id)
-        .ok_or_else(|| format!("配置文件不存在：{id}"))?;
-    apply_profile(profile)?;
-    write_profiles_to_config(&profiles, &id)?;
-    Ok(serde_json::json!({ "active_profile_id": id }))
-}
-
-/// 将 Profile 的设置应用到运行时
-fn apply_profile(p: &Profile) -> Result<(), String> {
-    proxy::update_runtime(
-        if p.api_key.is_empty() { None } else { Some(p.api_key.clone()) },
-        Some(p.model_override.clone()),
-        Some(p.upstream_url.clone()),
-        Some(p.max_concurrency),
-        Some(UpstreamFormat::from_str(&p.upstream_format)),
-    );
-
-    // 同步更新调度器渠道状态
-    if let Some(scheduler) = SCHEDULER.get() {
-        scheduler.update_channel(
-            &p.id,
-            p.enabled,
-            p.max_concurrency,
-            p.max_rpm,
-            p.max_tpm,
-            p.weight,
-        );
-    }
-
-    println!("[main] 已切换到配置文件：{}", p.name);
-    if let Some(handle) = proxy::app_handle() {
-        let _ = handle.emit("server-info-changed", ());
-    }
-    Ok(())
+    write_profiles_to_config(&profiles)?;
+    // 渠道立即退出调度
+    unregister_profile(&id);
+    Ok(serde_json::json!({ "profiles": profiles }))
 }
 
 /// 获取调度器实时状态（各渠道并发 / RPM / TPM / 权重）
 #[tauri::command]
 fn get_scheduler_status() -> serde_json::Value {
-    if let Some(scheduler) = SCHEDULER.get() {
-        let channels = scheduler.snapshot();
-        serde_json::json!({ "channels": channels })
-    } else {
-        serde_json::json!({ "channels": [] })
+    match proxy::scheduler() {
+        Some(scheduler) => serde_json::json!({ "channels": scheduler.snapshot() }),
+        None => serde_json::json!({ "channels": [] }),
     }
-}
-
-fn read_api_key() -> String {
-    // 只认 JSON 配置：包外数据目录（仅 macOS）/ 工作目录 / exe 同目录
-    // 的 token-monitor.json {"api_key": "..."}
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(dir) = app_data_override() {
-        candidates.push(dir.join("token-monitor.json"));
-    }
-    candidates.extend(
-        [
-            std::env::current_dir().ok().map(|d| d.join("token-monitor.json")),
-            std::env::current_exe().ok().map(|d| {
-                d.parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .join("token-monitor.json")
-            }),
-        ]
-        .into_iter()
-        .flatten(),
-    );
-    for candidate in candidates {
-        if let Ok(text) = std::fs::read_to_string(&candidate) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(k) = v.get("api_key").and_then(|k| k.as_str()) {
-                    let k = k.trim();
-                    if !k.is_empty() {
-                        println!("loaded api key from {}", candidate.display());
-                        return k.to_string();
-                    }
-                }
-            }
-        }
-    }
-    String::new()
 }
 
 fn read_saved_config_str(key: &str) -> String {
@@ -738,75 +594,40 @@ fn main() {
             Some(vec![]),
         ))
         .setup(|app| {            // 初始化代理配置并启动后端服务（随程序自动运行）
-            let saved_model = read_saved_config_str("model_override");
-            let saved_upstream = read_saved_config_str("upstream_url");
-            let saved_max_conc: usize = read_saved_config_str("max_concurrency")
-                .parse()
-                .unwrap_or(20);
             // Codeg 配置独立加载；未配置时保持默认，不阻塞应用启动
             let codeg_config_v: serde_json::Value = parse_saved_config(serde_json::Value::clone);
             codeg::load_from_json(&codeg_config_v);
             // 余额与探针配置同样独立加载，缺省即用默认值
             balance::load_from_json(&codeg_config_v);
             probe::load_from_json(&codeg_config_v);
-            let mut cfg = proxy::ProxyConfig {
-                api_key: read_api_key(),
-                model_override: saved_model,
+
+            // 渠道列表是唯一配置来源；全局运行时只保留端口，
+            // 上游地址 / 密钥 / 格式一律由调度选中的渠道提供
+            let profiles = read_profiles_from_config();
+            let cfg = proxy::ProxyConfig {
                 port: proxy_port(),
-                upstream_url: saved_upstream,
-                max_concurrency: saved_max_conc,
+                api_key: String::new(),
+                model_override: String::new(),
+                upstream_url: String::new(),
+                max_concurrency: 0,
                 upstream_format: UpstreamFormat::Responses,
             };
-            // 如果存在已激活的配置文件，用其值覆盖扁平变量（旧变量已弃用）
-            let (profiles, active_id) = read_profiles_from_config();
-            if !active_id.is_empty() {
-                if let Some(active) = profiles.iter().find(|p| p.id == active_id) {
-                    println!("[main] 启动时应用配置文件：{}", active.name);
-                    if !active.api_key.is_empty() {
-                        cfg.api_key = active.api_key.clone();
-                    }
-                    if !active.model_override.is_empty() {
-                        cfg.model_override = active.model_override.clone();
-                    }
-                    if !active.upstream_url.is_empty() {
-                        cfg.upstream_url = active.upstream_url.clone();
-                    }
-                    cfg.max_concurrency = active.max_concurrency;
-                    if !active.upstream_format.is_empty() {
-                        cfg.upstream_format = UpstreamFormat::from_str(&active.upstream_format);
-                    }
-                }
-            }
-            if cfg.api_key.is_empty() {
-                eprintln!(
-                    "警告：未配置 API Key，请在 token-monitor.json 的 api_key 字段填写，代理将返回配置错误"
-                );
-            }
-            // 同步初始化代理配置（前端 WebView 可能立即查询）
+            // 同步初始化代理配置与调度器（前端 WebView 可能立即查询）
             proxy::init(app.handle().clone(), cfg.clone());
 
-            // 初始化全局调度器，为每个 profile 创建渠道
-            let sched = scheduler::Scheduler::new();
+            // 注册所有渠道：并发 / RPM / TPM / 权重 + 上游凭据
             for p in &profiles {
-                sched.add_channel(scheduler::ChannelState::new(
-                    p.id.clone(),
-                    p.max_concurrency,
-                    p.max_rpm,
-                    p.max_tpm,
-                    p.weight,
-                ));
-                // 仅当前激活的 profile 启用调度
-                let is_active = p.id == active_id;
-                sched.update_channel(
-                    &p.id,
-                    is_active && p.enabled,
-                    p.max_concurrency,
-                    p.max_rpm,
-                    p.max_tpm,
-                    p.weight,
-                );
+                register_profile(p);
             }
-            let _ = SCHEDULER.set(sched);
+            let enabled = profiles.iter().filter(|p| p.enabled).count();
+            println!(
+                "[main] 已注册 {} 个渠道，其中 {} 个参与调度",
+                profiles.len(),
+                enabled
+            );
+            if enabled == 0 {
+                eprintln!("警告：没有启用中的渠道，请在设置中开启至少一个渠道参与调度");
+            }
 
             // macOS：启用原生标题栏装饰（红绿灯），Windows/Linux 保持 decorations: false
             #[cfg(target_os = "macos")]
@@ -926,8 +747,6 @@ fn main() {
             get_codeg_status,
             codeg_session_action,
             set_port,
-            set_model_config,
-            set_upstream,
             get_close_action,
             set_close_action,
             get_autostart,
@@ -935,7 +754,6 @@ fn main() {
             get_profiles,
             save_profile,
             delete_profile,
-            set_active_profile,
             get_scheduler_status,
             balance::get_balance_settings,
             balance::set_balance_settings,

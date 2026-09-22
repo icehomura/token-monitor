@@ -155,20 +155,9 @@ impl Scheduler {
         }
     }
 
-    /// 添加渠道
-    pub fn add_channel(&self, channel: ChannelState) {
-        let mut channels = self.channels.write().unwrap();
-        channels.push(channel);
-    }
-
-    /// 移除渠道
-    pub fn remove_channel(&self, profile_id: &str) {
-        let mut channels = self.channels.write().unwrap();
-        channels.retain(|c| c.profile_id != profile_id);
-    }
-
-    /// 更新渠道配置（通过原子写入，无需可变引用）
-    pub fn update_channel(
+    /// 新增或更新渠道（保存 profile 时调用）。
+    /// 已存在则就地更新配置，不存在则创建。
+    pub fn upsert_channel(
         &self,
         profile_id: &str,
         enabled: bool,
@@ -177,14 +166,24 @@ impl Scheduler {
         max_tpm: u64,
         weight: u32,
     ) {
-        let channels = self.channels.read().unwrap();
+        let mut channels = self.channels.write().unwrap();
         if let Some(ch) = channels.iter().find(|c| c.profile_id == profile_id) {
             ch.set_enabled(enabled);
             ch.set_max_concurrency(max_concurrency);
             ch.set_max_rpm(max_rpm);
             ch.set_max_tpm(max_tpm);
             ch.set_weight(weight);
+            return;
         }
+        let ch = ChannelState::new(profile_id.to_string(), max_concurrency, max_rpm, max_tpm, weight);
+        ch.set_enabled(enabled);
+        channels.push(ch);
+    }
+
+    /// 移除渠道（删除 profile 时调用）
+    pub fn remove_channel(&self, profile_id: &str) {
+        let mut channels = self.channels.write().unwrap();
+        channels.retain(|c| c.profile_id != profile_id);
     }
 
     // ──────── 核心调度 ────────
@@ -241,6 +240,35 @@ impl Scheduler {
         let pick = random_u64() % total_weight;
         let selected = candidates.iter().find(|(_, cum)| pick < *cum).unwrap();
         Some(selected.0.profile_id.clone())
+    }
+
+    /// 第一个已启用渠道的 id。
+    /// 探针 / 余额查询需要一个具体的上游目标，动态调度下用首个启用渠道代表。
+    pub fn first_enabled_id(&self) -> Option<String> {
+        self.channels
+            .read()
+            .unwrap()
+            .iter()
+            .find(|c| c.is_enabled())
+            .map(|c| c.profile_id.clone())
+    }
+
+    /// 是否存在已启用的渠道。
+    /// 用于区分「所有渠道被禁用」（应立即报错）与「所有渠道已满」（应排队等待）。
+    pub fn has_enabled_channel(&self) -> bool {
+        self.channels.read().unwrap().iter().any(|c| c.is_enabled())
+    }
+
+    /// 已启用渠道的并发上限之和，作为全局并发闸门。
+    /// 不能沿用单个渠道的上限，否则大并发渠道会被小渠道的上限卡住。
+    pub fn total_concurrency(&self) -> usize {
+        self.channels
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|c| c.is_enabled())
+            .map(|c| c.max_concurrency())
+            .sum()
     }
 
     // ──────── 并发槽位管理 ────────
@@ -352,7 +380,7 @@ mod tests {
     #[test]
     fn test_acquire_release_slot() {
         let s = Scheduler::new();
-        s.add_channel(ChannelState::new("ch1".into(), 2, 0, 0, 100));
+        s.upsert_channel("ch1", true, 2, 0, 0, 100);
         assert!(s.acquire_slot("ch1"));
         assert!(s.acquire_slot("ch1"));
         assert!(!s.acquire_slot("ch1")); // 已满
@@ -363,8 +391,8 @@ mod tests {
     #[test]
     fn test_select_channel_respects_limits() {
         let s = Scheduler::new();
-        s.add_channel(ChannelState::new("ch1".into(), 1, 0, 0, 100));
-        s.add_channel(ChannelState::new("ch2".into(), 1, 0, 0, 100));
+        s.upsert_channel("ch1", true, 1, 0, 0, 100);
+        s.upsert_channel("ch2", true, 1, 0, 0, 100);
 
         // ch1 占满并发
         assert!(s.acquire_slot("ch1"));
@@ -376,16 +404,52 @@ mod tests {
     #[test]
     fn test_select_channel_all_disabled() {
         let s = Scheduler::new();
-        let ch = ChannelState::new("ch1".into(), 1, 0, 0, 100);
-        ch.set_enabled(false);
-        s.add_channel(ch);
+        s.upsert_channel("ch1", false, 1, 0, 0, 100);
         assert_eq!(s.select_channel(), None);
+        // 全禁用时应当能被识别出来，区别于「全满」
+        assert!(!s.has_enabled_channel());
+        assert_eq!(s.total_concurrency(), 0);
+    }
+
+    /// 回归保护：upsert 必须能新增，也能就地更新已有渠道
+    #[test]
+    fn test_upsert_channel_creates_then_updates() {
+        let s = Scheduler::new();
+        s.upsert_channel("ch1", true, 5, 10, 1000, 100);
+        assert_eq!(s.snapshot().len(), 1);
+        assert_eq!(s.total_concurrency(), 5);
+
+        // 再次 upsert 同一个 id 应就地更新，而不是追加
+        s.upsert_channel("ch1", false, 30, 60, 9000, 200);
+        let snap = s.snapshot();
+        assert_eq!(snap.len(), 1, "upsert 不应产生重复渠道");
+        assert_eq!(snap[0].max_concurrency, 30);
+        assert_eq!(snap[0].max_rpm, 60);
+        assert_eq!(snap[0].max_tpm, 9000);
+        assert_eq!(snap[0].weight, 200);
+        assert!(!snap[0].enabled);
+        // 禁用渠道不计入全局并发闸门
+        assert_eq!(s.total_concurrency(), 0);
+    }
+
+    /// 回归保护：删除渠道后不应再参与调度
+    #[test]
+    fn test_remove_channel() {
+        let s = Scheduler::new();
+        s.upsert_channel("ch1", true, 5, 0, 0, 100);
+        s.upsert_channel("ch2", true, 5, 0, 0, 100);
+        assert_eq!(s.total_concurrency(), 10);
+
+        s.remove_channel("ch1");
+        assert_eq!(s.snapshot().len(), 1);
+        assert_eq!(s.total_concurrency(), 5);
+        assert_eq!(s.select_channel().as_deref(), Some("ch2"));
     }
 
     #[test]
     fn test_record_request() {
         let s = Scheduler::new();
-        s.add_channel(ChannelState::new("ch1".into(), 10, 0, 0, 100));
+        s.upsert_channel("ch1", true, 10, 0, 0, 100);
         s.record_request("ch1", 500);
         let snap = s.snapshot();
         assert_eq!(snap[0].current_rpm, 1);

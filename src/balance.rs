@@ -255,7 +255,7 @@ pub async fn get_balance() -> Result<serde_json::Value, String> {
             "reason": "当前上游非 DeepSeek 官方，余额查询不可用",
         }));
     }
-    let api_key = crate::proxy::cfg().api_key.trim().to_string();
+    let api_key = crate::proxy::default_api_key().trim().to_string();
     if api_key.is_empty() {
         return Err("API Key 未配置，无法查询余额".into());
     }

@@ -31,7 +31,7 @@
         <!-- ── Tab：AI 服务 ── -->
         <div v-show="activeTab === 'ai'" class="tab-pane">
         <!-- 配置文件管理 -->
-        <SettingsCard title="AI 服务配置" description="管理多组 API 地址、模型和密钥配置，点击切换激活" auto>
+        <SettingsCard title="AI 服务配置" description="管理多组 API 地址、模型和密钥配置，多个渠道自动调度" auto>
           <template #actions>
             <BaseButton variant="primary" @click="addNewProfile">
               <span style="margin-right:4px">+</span> 新建配置文件
@@ -42,8 +42,6 @@
               v-for="p in profiles"
               :key="p.id"
               class="profile-item"
-              :class="{ active: p.id === activeProfileId }"
-              @click="selectProfile(p)"
             >
               <div class="profile-info">
                 <span class="profile-name">{{ p.name }}</span>
@@ -196,7 +194,7 @@
               <small :class="['ff-hint', unitMsgType]">{{ unitMsg }}</small>
             </template>
           </SettingsCard>
-          <SettingsCard title="并发数限制" :description="`当前激活配置的上限`">
+          <SettingsCard title="并发数限制" description="当前启用渠道的并发上限之和">
             <div class="status-row">
               <span class="status-icon" style="background:var(--blue)">⚡</span>
               <span class="status-text">当前并发 {{ stats.concurrency }} / {{ currentMaxConcurrency }}</span>
@@ -253,7 +251,7 @@
 
         <!-- 底部 -->
         <div class="modal-footer">
-          <span class="footer-hint">配置文件切换立即生效，无需重启服务</span>
+          <span class="footer-hint">配置修改立即生效，无需重启服务</span>
         </div>
       </div>
     </div>
@@ -326,14 +324,16 @@ const unitToggle = computed({
 
 // ──────── Profile 状态 ────────
 const profiles = ref([])
-const activeProfileId = ref('')
 const editingProfile = ref(null)
 const profileMsg = ref('')
 const profileMsgType = ref('')
 
+// 动态调度下不再有「激活配置」，上限取所有启用渠道并发上限之和。
+// 无启用渠道时不能回落成数字，否则会显示一个并不存在的上限。
 const currentMaxConcurrency = computed(() => {
-  const p = profiles.value.find(p => p.id === activeProfileId.value)
-  return p ? p.max_concurrency : 20
+  const enabled = profiles.value.filter(p => p.enabled)
+  const total = enabled.reduce((sum, p) => sum + (Number(p.max_concurrency) || 0), 0)
+  return enabled.length === 0 ? '未启用渠道' : total
 })
 
 // ──────── 其他设置状态 ────────
@@ -400,15 +400,13 @@ watch(() => props.visible, async (v) => {
   try {
     const r = await invoke('get_profiles')
     profiles.value = r.profiles || []
-    activeProfileId.value = r.active_profile_id || ''
   } catch {}
   // 加载通用设置
   try {
     const s = await invoke('get_settings')
     port.value = s.port
-    settingsInfo.value = `API Key：${s.has_api_key ? '已配置' : '未配置'}` +
-      (s.model_override ? ` · 强制模型 ${s.model_override}` : ' · 未强制模型') +
-      ` · 并发上限 ${s.max_concurrency}`
+    settingsInfo.value = `渠道 ${s.enabled_count}/${s.channel_count} 参与调度` +
+      ` · 并发上限 ${s.total_concurrency}`
   } catch {}
   try {
     const ca = await invoke('get_close_action')
@@ -499,17 +497,6 @@ async function toggleProfile(p, enabled) {
   }
 }
 
-function selectProfile(p) {
-  if (p.id === activeProfileId.value) return
-  invoke('set_active_profile', { id: p.id }).then(r => {
-    activeProfileId.value = r.active_profile_id
-    profileMsg.value = `✓ 已切换到「${p.name}」`
-    profileMsgType.value = 'ok'
-  }).catch(e => {
-    profileMsg.value = String(e); profileMsgType.value = 'err'
-  })
-}
-
 function addNewProfile() {
   editingProfile.value = {
     id: '',
@@ -529,7 +516,6 @@ function editProfile(p) {
 function deleteProfile(p) {
   invoke('delete_profile', { id: p.id }).then(r => {
     profiles.value = r.profiles || []
-    activeProfileId.value = r.active_profile_id || ''
     profileMsg.value = `✓ 已删除「${p.name}」`
     profileMsgType.value = 'ok'
   }).catch(e => {
@@ -755,19 +741,14 @@ async function savePort() {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 8px;
-  cursor: pointer;
+  cursor: default;
   transition: border-color .15s, background .15s;
 }
 .profile-item:hover { border-color: var(--muted); }
-.profile-item.active { border-color: var(--blue); background: rgba(79,140,255,.08); }
 .profile-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .profile-name { font-size: 13px; font-weight: 600; color: var(--text); }
 .profile-detail { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .profile-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
-.profile-active-badge {
-  font-size: 11px; color: var(--blue); background: rgba(79,140,255,.12);
-  padding: 2px 8px; border-radius: 4px; font-weight: 600;
-}
 .profile-edit-btn, .profile-del-btn {
   width: 26px !important; height: 26px !important; border-radius: 4px;
 }
