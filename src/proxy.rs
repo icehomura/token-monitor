@@ -72,6 +72,7 @@ pub struct ProxyConfig {
 
 static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 static CONFIG: std::sync::RwLock<Option<ProxyConfig>> = std::sync::RwLock::new(None);
+static SCHEDULER: OnceLock<crate::scheduler::Scheduler> = OnceLock::new();
 
 struct ServerHandle {
     shutdown: tokio::sync::watch::Sender<bool>,
@@ -89,6 +90,7 @@ const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 pub fn init(handle: tauri::AppHandle, cfg: ProxyConfig) {
     let _ = APP_HANDLE.set(handle);
     *CONFIG.write().unwrap_or_else(|e| e.into_inner()) = Some(cfg);
+    let _ = SCHEDULER.set(crate::scheduler::Scheduler::new());
 }
 
 pub fn cfg() -> ProxyConfig {
@@ -135,6 +137,10 @@ pub fn upstream_url() -> String {
 /// 获取 AppHandle（供 main.rs 调用事件通知）
 pub fn app_handle() -> Option<&'static tauri::AppHandle> {
     APP_HANDLE.get()
+}
+
+pub(crate) fn scheduler() -> Option<&'static crate::scheduler::Scheduler> {
+    SCHEDULER.get()
 }
 
 /// 停掉旧服务（如有），在新端口重新绑定并监听。
@@ -2046,9 +2052,63 @@ pub(crate) async fn acquire_slot() -> Option<stats::SlotGuard> {
 
 /// 软并发调度：使用配置中的 max_concurrency，超过时先等待。
 /// 最长等待 120 秒；超时后返回 429。
-async fn wait_for_slot() -> Result<stats::SlotGuard, Response> {
+/// 返回 (SlotGuard, profile_id)：profile_id 用于调度器的请求完成追踪。
+async fn wait_for_slot() -> Result<(stats::SlotGuard, String), Response> {
+    // 尝试通过调度器选择最优渠道
+    if let Some(sched) = SCHEDULER.get() {
+        if let Some(profile_id) = sched.select_channel() {
+            let max = cfg().max_concurrency;
+            let mut waited = false;
+            for _ in 0..600 {
+                // 全局并发槽位
+                if let Some(id) = stats::try_acquire(max as u64) {
+                    if waited {
+                        println!("[proxy] 并发达到上限，已等待排空；当前并发 {}", stats::active());
+                    }
+                    if let Some(h) = APP_HANDLE.get() {
+                        let _ = h.emit("stats-updated", ());
+                    }
+                    // 渠道并发槽位
+                    if sched.acquire_slot(&profile_id) {
+                        return Ok((stats::SlotGuard::new(id), profile_id));
+                    }
+                    // 渠道已满，释放全局槽位继续等待（drop SlotGuard 触发 ACTIVE -1）
+                    drop(stats::SlotGuard::new(id));
+                }
+                waited = true;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            eprintln!(
+                "[proxy] 并发持续占满 {}（当前 {}），等待 120s 超时",
+                max,
+                stats::active()
+            );
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": {
+                        "message": format!("并发请求已达上限（{}），排队等待 2 分钟仍未获取到槽位，请稍后重试", MAX_CONCURRENCY),
+                        "type": "concurrency_limit_exceeded",
+                    }
+                })),
+            )
+                .into_response());
+        }
+        // 所有渠道都满了
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": {
+                    "message": "所有渠道均已达到并发上限，请稍后重试",
+                    "type": "channel_limit_exceeded",
+                }
+            })),
+        )
+            .into_response());
+    }
+    // 调度器未初始化时降级到原有逻辑
     match acquire_slot().await {
-        Some(g) => Ok(g),
+        Some(g) => Ok((g, String::new())),
         None => Err((
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({
@@ -2324,10 +2384,11 @@ async fn chat_completions(
         .to_string();
 
     // 排队获取并发槽位（超时 120s 返回 429）
-    let guard = match wait_for_slot().await {
+    let (guard, profile_id) = match wait_for_slot().await {
         Ok(g) => g,
         Err(resp) => return resp,
     };
+    let _profile_id_for_stream = profile_id.clone();
 
     let upstream = match send_upstream(&payload, &user_agent).await {
         Ok(r) => r,
@@ -2357,6 +2418,7 @@ async fn chat_completions(
             let cc = responses_to_chat_json(&serde_json::from_str::<Value>(&full).unwrap_or(json!({})), &model);
             stats::update_tokens_db_only(guard.idx(), tc);
             guard.release();
+            if let Some(sched) = SCHEDULER.get() { sched.release_slot(&profile_id); sched.record_request(&profile_id, 0); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
             return (StatusCode::OK, Json(cc)).into_response();
         } else if upstream_fmt == UpstreamFormat::ChatCompletions {
@@ -2375,6 +2437,7 @@ async fn chat_completions(
             };
             stats::update_tokens_db_only(guard.idx(), tc);
             guard.release();
+            if let Some(sched) = SCHEDULER.get() { sched.release_slot(&profile_id); sched.record_request(&profile_id, 0); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
             return Response::builder().status(StatusCode::OK)
                 .header("content-type", content_type)
@@ -2391,6 +2454,7 @@ async fn chat_completions(
             let cc = anthropic_json_to_chat(&v);
             stats::update_tokens_db_only(guard.idx(), tc);
             guard.release();
+            if let Some(sched) = SCHEDULER.get() { sched.release_slot(&profile_id); sched.record_request(&profile_id, 0); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
             return (StatusCode::OK, Json(cc)).into_response();
         }
@@ -2434,7 +2498,9 @@ async fn chat_completions(
         drop(tx);
         let tc = if upstream_usage.input > 0 || upstream_usage.output > 0 { upstream_usage }
         else { stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 } };
+        let output_tokens = tc.output;
         stats::update_last_tokens(idx, tc);
+        if let Some(sched) = SCHEDULER.get() { sched.release_slot(&_profile_id_for_stream); sched.record_request(&_profile_id_for_stream, output_tokens); }
         if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
     });
 
@@ -2454,7 +2520,7 @@ async fn responses_api(
         body["model"] = json!(cfg().model_override);
     }
 
-    let guard = match wait_for_slot().await {
+    let (guard, profile_id) = match wait_for_slot().await {
         Ok(g) => g,
         Err(resp) => return resp,
     };
@@ -2512,6 +2578,7 @@ async fn responses_api(
         };
         stats::update_tokens_db_only(guard.idx(), tc);
         guard.release();
+        if let Some(sched) = SCHEDULER.get() { sched.release_slot(&profile_id); sched.record_request(&profile_id, 0); }
         if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
         return Response::builder().status(StatusCode::OK)
             .header("content-type", content_type)
@@ -2584,7 +2651,9 @@ async fn responses_api(
         drop(tx);
         let tc = if usage.input > 0 || usage.output > 0 { usage }
         else { stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 } };
+        let output_tokens = tc.output;
         stats::update_last_tokens(idx, tc);
+        if let Some(sched) = SCHEDULER.get() { sched.release_slot(&profile_id); sched.record_request(&profile_id, output_tokens); }
         if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
     });
 
@@ -2616,7 +2685,7 @@ async fn anthropic_messages(
         .unwrap_or("")
         .to_string();
 
-    let guard = match wait_for_slot().await {
+    let (guard, profile_id) = match wait_for_slot().await {
         Ok(g) => g,
         Err(resp) => return resp,
     };
@@ -2637,6 +2706,7 @@ async fn anthropic_messages(
             else { stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 } };
             stats::update_tokens_db_only(guard.idx(), tc.clone());
             guard.release();
+            if let Some(sched) = SCHEDULER.get() { sched.release_slot(&profile_id); sched.record_request(&profile_id, 0); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
             return (StatusCode::OK, Json(chat_completion_to_anthropic(&cc, &tc))).into_response();
         } else {
@@ -2662,6 +2732,7 @@ async fn anthropic_messages(
             };
             stats::update_tokens_db_only(guard.idx(), tc);
             guard.release();
+            if let Some(sched) = SCHEDULER.get() { sched.release_slot(&profile_id); sched.record_request(&profile_id, 0); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
             return (StatusCode::OK, Json(anthropic_val)).into_response();
         }
@@ -2697,7 +2768,9 @@ async fn anthropic_messages(
         drop(tx);
         let tc = if upstream_usage.input > 0 || upstream_usage.output > 0 { upstream_usage }
         else { stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 } };
+        let output_tokens = tc.output;
         stats::update_last_tokens(idx, tc);
+        if let Some(sched) = SCHEDULER.get() { sched.release_slot(&profile_id); sched.record_request(&profile_id, output_tokens); }
         if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
     });
 

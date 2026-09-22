@@ -4,6 +4,35 @@
   "upstream_url": "https://your-upstream.example.com/v1/responses",
   "port": 8188,
   "upstream_format": "responses",
+  "profiles": [
+    {
+      "id": "example-1",
+      "name": "示例渠道A",
+      "upstream_url": "https://api.example.com/v1/responses",
+      "api_key": "sk-xxx",
+      "model_override": "",
+      "max_concurrency": 20,
+      "upstream_format": "responses",
+      "enabled": true,
+      "max_rpm": 30,
+      "max_tpm": 100000,
+      "weight": 100
+    },
+    {
+      "id": "example-2",
+      "name": "示例渠道B",
+      "upstream_url": "https://api2.example.com/v1/responses",
+      "api_key": "sk-yyy",
+      "model_override": "gpt-4",
+      "max_concurrency": 10,
+      "upstream_format": "chat_completions",
+      "enabled": true,
+      "max_rpm": 0,
+      "max_tpm": 0,
+      "weight": 50
+    }
+  ],
+  "active_profile_id": "example-1",
   "balance": {
     "enabled": false,
     "currency": "CNY",

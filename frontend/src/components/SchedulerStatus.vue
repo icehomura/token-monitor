@@ -1,0 +1,133 @@
+<template>
+  <SettingsCard title="调度状态" description="查看各渠道实时调度情况" auto>
+    <div class="scheduler-grid">
+      <div v-for="ch in channels" :key="ch.profile_id" class="channel-item" :class="{ disabled: !ch.enabled }">
+        <div class="channel-header">
+          <span class="channel-name">{{ ch.name }}</span>
+          <span v-if="!ch.enabled" class="channel-disabled">已禁用</span>
+        </div>
+        <div class="channel-stats">
+          <div class="stat">
+            <span class="stat-label">并发</span>
+            <span class="stat-value">{{ ch.current_concurrency }}/{{ ch.max_concurrency }}</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">RPM</span>
+            <span class="stat-value">{{ ch.current_rpm }}/{{ ch.max_rpm || '∞' }}</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">TPM</span>
+            <span class="stat-value">{{ formatToken(ch.current_tpm) }}/{{ ch.max_tpm ? formatToken(ch.max_tpm) : '∞' }}</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">权重</span>
+            <span class="stat-value">{{ ch.weight }}</span>
+          </div>
+        </div>
+      </div>
+      <div v-if="channels.length === 0" class="no-channels">
+        暂无渠道配置
+      </div>
+    </div>
+  </SettingsCard>
+</template>
+
+<script setup>
+import { ref, onMounted, onUnmounted } from 'vue'
+import { useTauri } from '../composables/useTauri'
+import SettingsCard from './SettingsCard.vue'
+
+const { invoke } = useTauri()
+const channels = ref([])
+let refreshTimer = null
+
+async function refresh() {
+  try {
+    const status = await invoke('get_scheduler_status')
+    channels.value = status.channels || []
+  } catch {}
+}
+
+function formatToken(n) {
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M'
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'K'
+  return String(n)
+}
+
+onMounted(() => {
+  refresh()
+  refreshTimer = setInterval(refresh, 2000)
+})
+
+onUnmounted(() => {
+  if (refreshTimer) clearInterval(refreshTimer)
+})
+</script>
+
+<style scoped>
+.scheduler-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 10px;
+}
+
+.channel-item {
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.channel-item.disabled {
+  opacity: 0.5;
+}
+
+.channel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.channel-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.channel-disabled {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.channel-stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.stat-label {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.stat-value {
+  font-size: 12px;
+  color: var(--text);
+  font-weight: 500;
+}
+
+.no-channels {
+  grid-column: 1 / -1;
+  text-align: center;
+  padding: 20px;
+  color: var(--muted);
+  font-size: 13px;
+}
+</style>

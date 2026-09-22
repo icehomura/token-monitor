@@ -47,10 +47,10 @@
             >
               <div class="profile-info">
                 <span class="profile-name">{{ p.name }}</span>
-                <span class="profile-detail">{{ p.upstream_url || '默认地址' }} · {{ formatLabel(p.upstream_format) }} · {{ p.model_override || '原始模型' }} · 并发{{ p.max_concurrency }}</span>
+                <span class="profile-detail">{{ p.upstream_url || '默认地址' }} · {{ formatLabel(p.upstream_format) }} · {{ p.model_override || '原始模型' }} · 并发{{ p.max_concurrency }}{{ p.max_rpm > 0 ? ` · RPM ${p.max_rpm}` : '' }}{{ p.max_tpm > 0 ? ` · TPM ${p.max_tpm}` : '' }}{{ p.weight !== 100 ? ` · 权重${p.weight}` : '' }}</span>
               </div>
               <div class="profile-actions">
-                <span v-if="p.id === activeProfileId" class="profile-active-badge">激活</span>
+                <BaseToggle :modelValue="p.enabled" @update:modelValue="toggleProfile(p, $event)" />
                 <IconButton class="profile-edit-btn" title="编辑" @click.stop="editProfile(p)">
                   <span style="font-size:12px">✎</span>
                 </IconButton>
@@ -65,6 +65,9 @@
             <small :class="['ff-hint', profileMsgType]">{{ profileMsg }}</small>
           </template>
         </SettingsCard>
+
+        <!-- 调度状态 -->
+        <SchedulerStatus />
 
         </div><!-- /Tab AI 服务 -->
 
@@ -273,6 +276,7 @@ import SettingsCard from './SettingsCard.vue'
 import DdSelect from './DdSelect.vue'
 import ThemeIcon from './ThemeIcon.vue'
 import ProfileEditModal from './ProfileEditModal.vue'
+import SchedulerStatus from './SchedulerStatus.vue'
 import { useTauri } from '../composables/useTauri'
 
 const { invoke } = useTauri()
@@ -482,6 +486,19 @@ watch(balanceEnabled, async (v) => {
 })
 
 // ──────── Profile 操作 ────────
+async function toggleProfile(p, enabled) {
+  const updated = { ...p, enabled }
+  try {
+    await invoke('save_profile', { profile: updated })
+    const idx = profiles.value.findIndex(x => x.id === p.id)
+    if (idx !== -1) profiles.value[idx].enabled = enabled
+    profileMsg.value = `✓ 已${enabled ? '启用' : '禁用'}「${p.name}」`
+    profileMsgType.value = 'ok'
+  } catch (e) {
+    profileMsg.value = String(e); profileMsgType.value = 'err'
+  }
+}
+
 function selectProfile(p) {
   if (p.id === activeProfileId.value) return
   invoke('set_active_profile', { id: p.id }).then(r => {
@@ -699,7 +716,8 @@ async function savePort() {
 
 /* 卡片间距：卡片直接位于各自 Tab 面板内 */
 .tab-pane > .settings-card,
-.tab-pane > .grid-2 { margin-bottom: 10px; }
+.tab-pane > .grid-2,
+.tab-pane > scheduler-status { margin-bottom: 10px; }
 .tab-pane > :last-child { margin-bottom: 0; }
 .grid-2 { align-items: stretch; }
 
@@ -712,6 +730,9 @@ async function savePort() {
 .settings-row .input-wrap { flex: 0 0 150px; min-width: 0; }
 .settings-row .ff-hint { margin-top: 0; }
 .settings-actions { display: flex; justify-content: flex-end; width: 100%; }
+.toggle-row {
+  display: flex; align-items: center; justify-content: space-between;
+}
 
 .ff-hint {
   display: block;

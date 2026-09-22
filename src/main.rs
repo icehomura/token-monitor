@@ -4,6 +4,7 @@ mod balance;
 mod codeg;
 mod probe;
 mod proxy;
+mod scheduler;
 mod stats;
 
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,22 @@ struct Profile {
     model_override: String,
     max_concurrency: usize,
     upstream_format: String,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    max_rpm: u64,
+    #[serde(default)]
+    max_tpm: u64,
+    #[serde(default = "default_weight")]
+    weight: u32,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_weight() -> u32 {
+    100
 }
 
 impl Default for Profile {
@@ -39,14 +56,29 @@ impl Default for Profile {
             model_override: String::new(),
             max_concurrency: 20,
             upstream_format: "responses".into(),
+            enabled: true,
+            max_rpm: 0,
+            max_tpm: 0,
+            weight: 100,
         }
     }
 }
+
+use std::sync::OnceLock;
 
 fn uuid_simple() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     format!("{:x}-{:04x}", t.as_secs(), t.subsec_nanos() & 0xFFFF)
+}
+
+// ──────── 全局调度器 ────────
+
+static SCHEDULER: OnceLock<scheduler::Scheduler> = OnceLock::new();
+
+/// 获取全局调度器实例（在 setup 阶段初始化后可用）
+pub(crate) fn scheduler() -> Option<&'static scheduler::Scheduler> {
+    SCHEDULER.get()
 }
 
 #[derive(Serialize)]
@@ -457,12 +489,35 @@ fn apply_profile(p: &Profile) -> Result<(), String> {
         Some(p.max_concurrency),
         Some(UpstreamFormat::from_str(&p.upstream_format)),
     );
+
+    // 同步更新调度器渠道状态
+    if let Some(scheduler) = SCHEDULER.get() {
+        scheduler.update_channel(
+            &p.id,
+            p.enabled,
+            p.max_concurrency,
+            p.max_rpm,
+            p.max_tpm,
+            p.weight,
+        );
+    }
+
     println!("[main] 已切换到配置文件：{}", p.name);
-    // 通知前端刷新服务端信息（toolbar 地址栏、模型名等）
     if let Some(handle) = proxy::app_handle() {
         let _ = handle.emit("server-info-changed", ());
     }
     Ok(())
+}
+
+/// 获取调度器实时状态（各渠道并发 / RPM / TPM / 权重）
+#[tauri::command]
+fn get_scheduler_status() -> serde_json::Value {
+    if let Some(scheduler) = SCHEDULER.get() {
+        let channels = scheduler.snapshot();
+        serde_json::json!({ "channels": channels })
+    } else {
+        serde_json::json!({ "channels": [] })
+    }
 }
 
 fn read_api_key() -> String {
@@ -730,6 +785,29 @@ fn main() {
             // 同步初始化代理配置（前端 WebView 可能立即查询）
             proxy::init(app.handle().clone(), cfg.clone());
 
+            // 初始化全局调度器，为每个 profile 创建渠道
+            let sched = scheduler::Scheduler::new();
+            for p in &profiles {
+                sched.add_channel(scheduler::ChannelState::new(
+                    p.id.clone(),
+                    p.max_concurrency,
+                    p.max_rpm,
+                    p.max_tpm,
+                    p.weight,
+                ));
+                // 仅当前激活的 profile 启用调度
+                let is_active = p.id == active_id;
+                sched.update_channel(
+                    &p.id,
+                    is_active && p.enabled,
+                    p.max_concurrency,
+                    p.max_rpm,
+                    p.max_tpm,
+                    p.weight,
+                );
+            }
+            let _ = SCHEDULER.set(sched);
+
             // macOS：启用原生标题栏装饰（红绿灯），Windows/Linux 保持 decorations: false
             #[cfg(target_os = "macos")]
             if let Some(w) = app.get_webview_window("main") {
@@ -858,6 +936,7 @@ fn main() {
             save_profile,
             delete_profile,
             set_active_profile,
+            get_scheduler_status,
             balance::get_balance_settings,
             balance::set_balance_settings,
             balance::get_balance,
