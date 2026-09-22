@@ -3,13 +3,18 @@
     <div class="scheduler-grid">
       <div v-for="ch in channels" :key="ch.profile_id" class="channel-item" :class="{ disabled: !ch.enabled }">
         <div class="channel-header">
-          <span class="channel-name">{{ ch.name }}</span>
+          <span class="channel-name">{{ ch.name || ch.profile_id }}</span>
           <span v-if="!ch.enabled" class="channel-disabled">已禁用</span>
         </div>
         <div class="channel-stats">
           <div class="stat">
             <span class="stat-label">并发</span>
-            <span class="stat-value">{{ ch.current_concurrency }}/{{ ch.max_concurrency }}</span>
+            <!-- 分母用自适应有效上限：上游限流时会低于配置上限，
+                 显示配置值会让人误以为还有余量 -->
+            <span class="stat-value">
+              {{ ch.current_concurrency }}/{{ ch.effective_limit }}
+              <span v-if="isThrottled(ch)" class="stat-note">上限 {{ ch.max_concurrency }}</span>
+            </span>
           </div>
           <div class="stat">
             <span class="stat-label">RPM</span>
@@ -52,6 +57,11 @@ function formatToken(n) {
   if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M'
   if (n >= 1000) return (n / 1000).toFixed(1) + 'K'
   return String(n)
+}
+
+// 自适应上限低于配置上限 → 当前正被上游限流而主动收紧
+function isThrottled(ch) {
+  return typeof ch.effective_limit === 'number' && ch.effective_limit < ch.max_concurrency
 }
 
 onMounted(() => {
@@ -121,6 +131,13 @@ onUnmounted(() => {
   font-size: 12px;
   color: var(--text);
   font-weight: 500;
+}
+
+/* 被限流收紧时的补充说明，弱化显示避免抢主数值 */
+.stat-note {
+  font-size: 10px;
+  color: var(--muted);
+  font-weight: 400;
 }
 
 .no-channels {

@@ -176,7 +176,7 @@ pub fn set_balance_settings(config: serde_json::Value) -> Result<serde_json::Val
         interval_secs,
     };
 
-    // 落盘：读改写整个 JSON，保留文件中的其它配置（与 probe / codeg 同范式）
+    // 落盘：读改写整个 JSON，保留文件中的其它配置（与 probe 同范式）
     let path = crate::config_path().ok_or("无法确定配置文件路径")?;
     let mut v: Value = std::fs::read_to_string(&path)
         .ok()
@@ -307,7 +307,7 @@ mod tests {
         assert!(is_official_upstream("api.deepseek.com/v1"));
         assert!(is_official_upstream("https://api.deepseek.com:443/v1"));
         // 非官方中转站、空串、畸形 URL、仿冒域名
-        assert!(!is_official_upstream("https://666sub2.i7a.top/v1/responses"));
+        assert!(!is_official_upstream("https://relay.example.com/v1/responses"));
         assert!(!is_official_upstream(""));
         assert!(!is_official_upstream("   "));
         assert!(!is_official_upstream("not a url"));

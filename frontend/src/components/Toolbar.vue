@@ -1,6 +1,9 @@
 <template>
   <header class="toolbar" ref="toolbarRef" @mousedown="tryDrag" @dblclick="onDblClick">
     <span class="endpoint" :title="endpointTitle">{{ endpointText }}</span>
+    <!-- 代理未监听时必须看得见：release 构建没有控制台，否则用户
+         只能在不明的客户端连接失败里才发现服务根本没起来 -->
+    <span v-if="serverError" class="server-warn" :title="serverError">⚠ 代理未监听</span>
     <IconButton class="copy-btn" title="复制 API 地址" @click="copyEndpoint">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <rect x="9" y="9" width="13" height="13" rx="2" />
@@ -69,6 +72,8 @@ const endpointTitle = ref('')
 const toolbarRef = ref(null)
 const showCopyModal = ref(false)
 const serverPort = ref(8188)
+// 代理服务最近一次启动失败的原因；非空即表示当前没有在监听
+const serverError = ref('')
 
 const activeRangeText = computed(() => {
   if (selectedRange.value !== 'custom' || !confirmedRange.value) return ''
@@ -122,6 +127,9 @@ async function initInfo() {
       endpointTitle.value = '支持的接口：' + info.endpoints.join('  ·  ')
     }
     serverPort.value = info.port || 8188
+    // 只在确有失败原因时告警：启动是异步的，前端可能先于监听就绪完成查询，
+    // 仅凭 listening=false 会误报「代理未监听」。
+    serverError.value = info.error || ''
   } catch {}
 }
 
@@ -196,6 +204,19 @@ defineExpose({ initInfo, selectedRange })
 .copy-btn :deep(svg) { width: 15px; height: 15px; }
 .test-btn { height: 34px; flex-shrink: 0; }
 .test-status { color: var(--muted); font-size: 12px; min-width: 60px; }
+/* 代理未监听：这行字本身就是故障信号，必须比周围的次要文本更醒目 */
+.server-warn {
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: #ff6b6b;
+  background: rgba(255, 107, 107, 0.12);
+  border: 1px solid rgba(255, 107, 107, 0.35);
+  border-radius: 6px;
+  padding: 3px 8px;
+  white-space: nowrap;
+  cursor: help;
+}
 .toolbar-right { margin-left: auto; display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
 .active-range {
   font-size: 12px;

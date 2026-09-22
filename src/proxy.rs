@@ -134,11 +134,20 @@ struct ServerHandle {
 
 static SERVER: std::sync::Mutex<Option<ServerHandle>> = std::sync::Mutex::new(None);
 
-/// 并发上限：超过后排队等待而不是返回 429
-const MAX_CONCURRENCY: usize = 20;
+/// 最近一次启动/切换代理服务失败的原因；成功时清空。
+///
+/// release 构建带 `windows_subsystem = "windows"`，没有控制台，`eprintln!`
+/// 无处输出。启动失败（如端口被占用）原本只写 stderr，用户看到的是
+/// 「窗口正常打开、托盘正常、统计有曲线」——却没有任何监听，
+/// 只能在客户端连不上时才发现。失败必须可观测，因此把原因留在进程内供前端读取。
+static LAST_SERVER_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// 流式读取的绝对超时：防止上游流一直不停导致并发槽位被永久占用
 const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// 收尾帧（finish / [DONE]）的发送超时。
+/// 客户端停止读取时通道会满，无界的 `send().await` 会让整个任务永久挂起。
+const TAIL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub fn init(handle: tauri::AppHandle, cfg: ProxyConfig) {
     let _ = APP_HANDLE.set(handle);
@@ -202,23 +211,85 @@ pub(crate) fn scheduler() -> Option<&'static crate::scheduler::Scheduler> {
     SCHEDULER.get()
 }
 
-/// 停掉旧服务（如有），在新端口重新绑定并监听。
-/// 返回 Err 表示端口绑定失败（如被占用），此时旧服务已停止。
+/// 代理服务当前是否在监听
+pub fn is_listening() -> bool {
+    SERVER.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
+/// 最近一次启动/切换失败的原因；None 表示最近一次是成功的。
+/// 启动早期尚未尝试过也返回 None —— 前端据此区分「从未启动」与「启动失败」。
+pub fn last_server_error() -> Option<String> {
+    LAST_SERVER_ERROR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn set_last_server_error(msg: Option<String>) {
+    *LAST_SERVER_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = msg;
+}
+
+/// 在新端口重新绑定并监听（停掉旧服务，如有）。
+///
+/// 顺序是「**先绑定新端口，再停旧服务**」：绑定失败（端口被占用等）时旧服务
+/// 仍在正常运行，调用方无需回滚任何状态，配置也不会被改坏。若反过来先停后绑，
+/// 一次失败的端口切换会让代理彻底掉线，而坏端口已经落盘——重启也起不来。
+///
+/// 成败都会记录到 `LAST_SERVER_ERROR`，供前端展示：release 构建没有控制台，
+/// 失败若只写 stderr 就等于没有告知用户。
 pub async fn restart_server(new_port: u16) -> Result<(), String> {
-    // 1. 停止旧实例，等待优雅退出释放端口
+    let result = restart_server_inner(new_port).await;
+    match &result {
+        Ok(()) => {
+            if last_server_error().is_some() {
+                println!("[proxy] 代理服务已恢复监听（端口 {new_port}）");
+            }
+            set_last_server_error(None);
+        }
+        Err(e) => {
+            eprintln!("[proxy] 代理服务启动失败：{e}");
+            set_last_server_error(Some(e.clone()));
+        }
+    }
+    // 主动通知前端：启动失败不会触发任何其它事件，前端无从刷新到这条状态。
+    // 复用既有事件名，Toolbar 已经在监听它。
+    if let Some(h) = APP_HANDLE.get() {
+        let _ = h.emit("server-info-changed", ());
+    }
+    result
+}
+
+async fn restart_server_inner(new_port: u16) -> Result<(), String> {
+    // 已经在目标端口上运行 → 直接返回，不做任何切换。
+    // 强行重绑会因端口被自己占用而失败（旧监听套接字未必随优雅关闭立即释放），
+    // 把一次「值没变」的保存变成一次掉线。
+    let already_running = {
+        let running = SERVER.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        let current = CONFIG
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|c| c.port);
+        running && current == Some(new_port)
+    };
+    if already_running {
+        return Ok(());
+    }
+
+    // 1. 先绑定新端口：失败时旧服务不受影响，配置保持原样
+    let app = build_router();
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], new_port));
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| format!("端口 {} 监听失败：{e}", new_port))?;
+
+    // 2. 绑定成功后再停旧实例，等待优雅退出释放端口
     //    先把锁作用域结束，避免 MutexGuard 跨 await 导致 future 非 Send
     let existing = SERVER.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(handle) = existing {
         let _ = handle.shutdown.send(true);
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-
-    // 2. 先绑定再注册：绑定失败直接报错给前端
-    let app = build_router();
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], new_port));
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| format!("端口 {} 监听失败：{e}", new_port))?;
 
     // 3. 更新配置并启动
     {
@@ -1061,8 +1132,8 @@ async fn convert_stream(
         let Ok(bytes) = chunk else { break };
         buf.extend_from_slice(&bytes);
 
-        while let Some(pos) = find_double_newline(&buf) {
-            let event_bytes: Vec<u8> = buf.drain(..pos + 2).collect();
+        while let Some((end, delim)) = find_sse_boundary(&buf) {
+            let event_bytes: Vec<u8> = buf.drain(..end + delim).collect();
             // 提取最后一个 data: 行
             let text = String::from_utf8_lossy(&event_bytes);
             let data_line = text
@@ -1164,8 +1235,47 @@ async fn convert_stream(
     (out_chars, used_tool_calls, usage)
 }
 
-fn find_double_newline(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\n\n")
+/// 若切片以行结束符开头，返回其长度。
+///
+/// SSE 规范允许 `\n`、`\r\n`、`\r` 三种行结束符。
+fn line_ending_len(s: &[u8]) -> Option<usize> {
+    if s.starts_with(b"\r\n") {
+        Some(2)
+    } else if s.starts_with(b"\n") || s.starts_with(b"\r") {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// 找到一个完整 SSE 帧的边界，返回 `(分隔符起点, 分隔符长度)`。
+/// 调用方据此 `drain(..start + len)` 取走整帧（含空行）。
+///
+/// 曾只匹配 `\n\n`，于是使用 `\r\n\r\n` 分帧的上游（或中间的反向代理/CDN）
+/// 会让帧边界**永远找不到**：转换路径整段丢弃内容（客户端只收到骨架帧，
+/// HTTP 200 却无正文），直通路径则 token 统计恒为 0，同时缓冲区按整条流的
+/// 长度增长。这里按规范识别全部三种行结束符及其混合形式。
+fn find_sse_boundary(buf: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0usize;
+    while i < buf.len() {
+        if line_ending_len(&buf[i..]).is_none() {
+            i += 1;
+            continue;
+        }
+        // 贪婪吞掉连续的行结束符：空行（≥2 个行结束符）即帧边界
+        let start = i;
+        let mut j = i;
+        let mut endings = 0usize;
+        while let Some(l) = line_ending_len(&buf[j..]) {
+            j += l;
+            endings += 1;
+        }
+        if endings >= 2 {
+            return Some((start, j - start));
+        }
+        i = j;
+    }
+    None
 }
 
 fn sse_frame(v: &Value) -> Vec<u8> {
@@ -1237,8 +1347,8 @@ async fn convert_stream_anthropic(
         let Ok(bytes) = chunk else { break };
         buf.extend_from_slice(&bytes);
 
-        while let Some(pos) = find_double_newline(&buf) {
-            let event_bytes: Vec<u8> = buf.drain(..pos + 2).collect();
+        while let Some((end, delim)) = find_sse_boundary(&buf) {
+            let event_bytes: Vec<u8> = buf.drain(..end + delim).collect();
             let text = String::from_utf8_lossy(&event_bytes);
             let data_line = text
                 .lines()
@@ -1417,8 +1527,8 @@ async fn passthrough_chat_stream(
         let Ok(bytes) = chunk else { break };
         if tx.send(Ok(bytes.to_vec())).await.is_err() { break; }
         buf.extend_from_slice(&bytes);
-        while let Some(pos) = find_double_newline(&buf) {
-            let event_bytes: Vec<u8> = buf.drain(..pos + 2).collect();
+        while let Some((end, delim)) = find_sse_boundary(&buf) {
+            let event_bytes: Vec<u8> = buf.drain(..end + delim).collect();
             let text = String::from_utf8_lossy(&event_bytes);
             if let Some(data_line) = text.lines().rev().find(|l| l.trim_start().starts_with("data:")) {
                 let payload = data_line.trim_start()["data:".len()..].trim();
@@ -1456,8 +1566,8 @@ async fn passthrough_anthropic_stream(
         let Ok(bytes) = chunk else { break };
         if tx.send(Ok(bytes.to_vec())).await.is_err() { break; }
         buf.extend_from_slice(&bytes);
-        while let Some(pos) = find_double_newline(&buf) {
-            let event_bytes: Vec<u8> = buf.drain(..pos + 2).collect();
+        while let Some((end, delim)) = find_sse_boundary(&buf) {
+            let event_bytes: Vec<u8> = buf.drain(..end + delim).collect();
             let text = String::from_utf8_lossy(&event_bytes);
             if let Some(data_line) = text.lines().rev().find(|l| l.trim_start().starts_with("data:")) {
                 let payload = data_line.trim_start()["data:".len()..].trim();
@@ -1724,8 +1834,8 @@ async fn convert_stream_chat_to_responses(
     'outer: while let Some(chunk) = stream.next().await {
         let Ok(bytes) = chunk else { break };
         buf.extend_from_slice(&bytes);
-        while let Some(pos) = find_double_newline(&buf) {
-            let event_bytes: Vec<u8> = buf.drain(..pos + 2).collect();
+        while let Some((end, delim)) = find_sse_boundary(&buf) {
+            let event_bytes: Vec<u8> = buf.drain(..end + delim).collect();
             let text = String::from_utf8_lossy(&event_bytes);
             let data_line = text.lines().rev().find(|l| l.trim_start().starts_with("data:"));
             let Some(data_line) = data_line else { continue };
@@ -1799,8 +1909,8 @@ async fn convert_stream_anthropic_to_responses(
     'outer: while let Some(chunk) = stream.next().await {
         let Ok(bytes) = chunk else { break };
         buf.extend_from_slice(&bytes);
-        while let Some(pos) = find_double_newline(&buf) {
-            let event_bytes: Vec<u8> = buf.drain(..pos + 2).collect();
+        while let Some((end, delim)) = find_sse_boundary(&buf) {
+            let event_bytes: Vec<u8> = buf.drain(..end + delim).collect();
             let text = String::from_utf8_lossy(&event_bytes);
             let data_line = text.lines().rev().find(|l| l.trim_start().starts_with("data:"));
             let Some(data_line) = data_line else { continue };
@@ -1878,6 +1988,15 @@ async fn convert_stream_chat_to_anthropic(
     let mut started = false;
     let mut text_index: Option<usize> = None;
     let mut next_index = 0usize;
+    // 所有已打开但尚未闭合的 content block（文本 + 工具），收尾时统一关闭。
+    // 每个 content_block_start 都**必须**有对应的 content_block_stop，
+    // 否则 Anthropic SDK 无法收束 input_json 分片，工具调用静默失效。
+    let mut open_blocks: Vec<usize> = Vec::new();
+    // OpenAI `tool_calls[].index` -> 已分配的本协议 block index。
+    // 必须按该 index 映射：并行工具调用会交错到达，且 arguments 可能出现在
+    // 不带 `function.name` 的后续分片里，不能靠「最后分配的那个索引」推断。
+    let mut tool_blocks: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    let mut used_tool_calls = false;
 
     macro_rules! ensure_started {
         () => {
@@ -1903,8 +2022,8 @@ async fn convert_stream_chat_to_anthropic(
     'outer: while let Some(chunk) = stream.next().await {
         let Ok(bytes) = chunk else { break };
         buf.extend_from_slice(&bytes);
-        while let Some(pos) = find_double_newline(&buf) {
-            let event_bytes: Vec<u8> = buf.drain(..pos + 2).collect();
+        while let Some((end, delim)) = find_sse_boundary(&buf) {
+            let event_bytes: Vec<u8> = buf.drain(..end + delim).collect();
             let text = String::from_utf8_lossy(&event_bytes);
             let data_line = text.lines().rev().find(|l| l.trim_start().starts_with("data:"));
             let Some(data_line) = data_line else { continue };
@@ -1922,6 +2041,7 @@ async fn convert_stream_chat_to_anthropic(
                         let i = next_index;
                         next_index += 1;
                         text_index = Some(i);
+                        open_blocks.push(i);
                         let _ = tx.send(Ok(anthropic_sse("content_block_start", &json!({
                             "type": "content_block_start",
                             "index": i,
@@ -1941,9 +2061,14 @@ async fn convert_stream_chat_to_anthropic(
             if let Some(tcs) = obj.pointer("/choices/0/delta/tool_calls").and_then(|t| t.as_array()) {
                 ensure_started!();
                 for tc in tcs {
+                    // OpenAI 用 index 标识同一工具调用的增量分片，缺省按 0 处理
+                    let tc_index = tc.get("index").and_then(|i| i.as_i64()).unwrap_or(0);
                     if let Some(name) = tc.pointer("/function/name").and_then(|n| n.as_str()) {
                         let bi = next_index;
                         next_index += 1;
+                        tool_blocks.insert(tc_index, bi);
+                        open_blocks.push(bi);
+                        used_tool_calls = true;
                         let _ = tx.send(Ok(anthropic_sse("content_block_start", &json!({
                             "type": "content_block_start",
                             "index": bi,
@@ -1956,10 +2081,14 @@ async fn convert_stream_chat_to_anthropic(
                         })))).await;
                     }
                     if let Some(args) = tc.pointer("/function/arguments").and_then(|a| a.as_str()) {
+                        // 只能打到该工具自己的块上。查不到说明 arguments 先于 name 到达，
+                        // 此时跳过，而不是回退到「最后分配的索引」——那会串到别的工具上，
+                        // 且在 next_index 为 0 时发生 usize 下溢（dev 构建 panic）。
+                        let Some(&bi) = tool_blocks.get(&tc_index) else { continue };
                         out_chars += args.chars().count() as u64;
                         let _ = tx.send(Ok(anthropic_sse("content_block_delta", &json!({
                             "type": "content_block_delta",
-                            "index": next_index - 1,
+                            "index": bi,
                             "delta": {"type": "input_json_delta", "partial_json": args},
                         })))).await;
                     }
@@ -1974,13 +2103,17 @@ async fn convert_stream_chat_to_anthropic(
         }
     }
     ensure_started!();
-    // close text block
-    if text_index.is_some() {
+    // 关闭所有已打开的块——文本块与工具块一视同仁。
+    // 曾只关闭文本块，导致 tool_use 块永远停在不闭合状态，工具调用静默失效。
+    // 顺序即打开顺序；Anthropic 规范按 index 寻址，不依赖闭合顺序。
+    for i in open_blocks {
         let _ = tx.send(Ok(anthropic_sse("content_block_stop", &json!({
-            "type": "content_block_stop", "index": text_index.unwrap(),
+            "type": "content_block_stop", "index": i,
         })))).await;
     }
-    let stop_reason = if usage.output > 0 { "end_turn" } else { "end_turn" };
+    // 有工具调用时必须报 tool_use。报 end_turn 会让客户端认为模型自然结束、
+    // 无工具待执行，从而直接退出 agent 循环。
+    let stop_reason = if used_tool_calls { "tool_use" } else { "end_turn" };
     let _ = tx.send(Ok(anthropic_sse("message_delta", &json!({
         "type": "message_delta",
         "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
@@ -2007,6 +2140,12 @@ async fn convert_stream_anthropic_to_chat(
     let mut used_tool_calls = false;
     let mut usage = stats::TokenCounts { input: 0, output: 0, cached: 0 };
     let mut started = false;
+    // Anthropic content block index -> Chat `tool_calls[].index`。
+    // Anthropic 的 index 空间同时包含 text 与 tool_use 块，而 Chat 的
+    // tool_calls index 只数工具，因此必须显式映射，不能把上游 index 直接照搬，
+    // 更不能硬编码 0——那会把多个并行工具压成同一个调用、参数互相拼接成非法 JSON。
+    let mut tool_index_map: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
+    let mut next_tool_index: u32 = 0;
 
     macro_rules! send_role {
         () => {
@@ -2020,8 +2159,8 @@ async fn convert_stream_anthropic_to_chat(
     'outer: while let Some(chunk) = stream.next().await {
         let Ok(bytes) = chunk else { break };
         buf.extend_from_slice(&bytes);
-        while let Some(pos) = find_double_newline(&buf) {
-            let event_bytes: Vec<u8> = buf.drain(..pos + 2).collect();
+        while let Some((end, delim)) = find_sse_boundary(&buf) {
+            let event_bytes: Vec<u8> = buf.drain(..end + delim).collect();
             let text = String::from_utf8_lossy(&event_bytes);
             let data_line = text.lines().rev().find(|l| l.trim_start().starts_with("data:"));
             let Some(data_line) = data_line else { continue };
@@ -2040,9 +2179,19 @@ async fn convert_stream_anthropic_to_chat(
                     }
                     if obj.pointer("/delta/type").and_then(|t| t.as_str()) == Some("input_json_delta") {
                         if let Some(args) = obj.pointer("/delta/partial_json").and_then(|a| a.as_str()) {
+                            // 用该块自己的 Chat 工具索引。查不到说明这个 delta
+                            // 没有对应的 content_block_start（异常流），跳过即可，
+                            // 不要回退到 0 —— 那会串到别的工具上。
+                            let Some(&ti) = obj
+                                .get("index")
+                                .and_then(|i| i.as_i64())
+                                .and_then(|ai| tool_index_map.get(&ai))
+                            else {
+                                continue;
+                            };
                             out_chars += args.chars().count() as u64;
                             let _ = tx.send(Ok(sse_frame(&make_chunk(&model, json!({
-                                "tool_calls": [{"index": 0, "function": {"arguments": args}}],
+                                "tool_calls": [{"index": ti, "function": {"arguments": args}}],
                             }), None)))).await;
                         }
                     }
@@ -2052,9 +2201,15 @@ async fn convert_stream_anthropic_to_chat(
                     if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                         send_role!();
                         used_tool_calls = true;
+                        // 为该块分配一个 Chat 工具索引并登记，后续 input_json_delta
+                        // 据此寻址；并行工具调用各得其所，不再全部塌缩到 0。
+                        let anthropic_index = obj.get("index").and_then(|i| i.as_i64()).unwrap_or(-1);
+                        let ti = next_tool_index;
+                        next_tool_index += 1;
+                        tool_index_map.insert(anthropic_index, ti);
                         let _ = tx.send(Ok(sse_frame(&make_chunk(&model, json!({
                             "tool_calls": [{
-                                "index": 0,
+                                "index": ti,
                                 "id": block.get("id").and_then(|i| i.as_str()).unwrap_or(""),
                                 "function": {"name": block.get("name").and_then(|n| n.as_str()).unwrap_or(""), "arguments": ""},
                             }],
@@ -2085,7 +2240,8 @@ async fn convert_stream_anthropic_to_chat(
 
 /// 渠道并发槽位守卫：drop 时自动归还渠道槽位并通知前端刷新。
 ///
-/// 探针 / 余额用 RAII 而非手动 `release_slot`，避免中途 `return` 泄漏槽位。
+/// 所有走闸门的路径（探针 / 余额 / 代理转发）都用 RAII 而非手动
+/// `release_slot`，避免中途 `return` 泄漏槽位。
 pub(crate) struct ChannelSlotGuard {
     profile_id: Option<String>,
 }
@@ -2138,20 +2294,62 @@ fn try_acquire_pair(
     None
 }
 
-/// 探针 / 余额的并发租约：持有全局与渠道槽位，drop 时自动归还。
+/// 并发租约：持有全局与渠道槽位，drop 时自动归还。
 ///
-/// `profile_id` 为空的字符串表示未占用渠道槽位（无调度器时的降级路径）。
+/// 代理转发与探针 / 余额共用同一抽象。归还交给 `Drop` 而不是手动调用
+/// `release_slot`，这样上游报错等**早退路径**也不会漏掉槽位。
+///
+/// `profile_id` 为空字符串表示未占用渠道槽位（无调度器时的降级路径）。
 pub(crate) struct Lease {
     pub profile_id: String,
     pub channel: ChannelConfig,
     global: Option<stats::SlotGuard>,
+    /// 声明在最后：drop 时最后归还渠道槽位，与获取顺序相反。
+    /// 该字段只用于 `Drop` 副作用，代码中不直接读取。
+    #[allow(dead_code)]
     channel_slot: ChannelSlotGuard,
 }
 
+impl Lease {
+    /// 收尾：摘除全局槽位，把释放责任交给 `stats::update_last_tokens`。
+    ///
+    /// 非流式与流式**共用这一条路径**。`update_last_tokens` 一次完成三件事：
+    /// 递减 ACTIVE、写入 token 数、把行标记为 `in_flight = 0`。
+    /// 因此不能用「只减计数器」的释放方式收尾——那样行会永远停在
+    /// `in_flight = 1`，被统计聚合（`WHERE in_flight = 0`）整体排除。
+    ///
+    /// 返回 SQLite rowid，<= 0 表示未占槽（DB 未就绪的降级路径）。
+    pub fn disarm_global(&mut self) -> i64 {
+        self.global.take().map(|g| g.disarm()).unwrap_or(0)
+    }
+
+    /// 交出**仍上膛**的全局守卫，供调用方移入 spawn 任务后再释放。
+    ///
+    /// 流式路径必须用这个而不是 `disarm_global()`：后者会立刻摘掉守卫，
+    /// 一旦 spawn 出去的任务 panic，就没人再递减 ACTIVE，槽位永久泄漏。
+    /// 守卫留在任务里，panic 展开时其 `Drop` 仍会归还。
+    pub fn take_global_guard(&mut self) -> Option<stats::SlotGuard> {
+        self.global.take()
+    }
+}
+
+/// 租约的兜底收尾：若全局守卫**从未被摘除**，说明调用方没有走正常收尾
+/// （探针 / 余额查询、以及 handler 的各类提前 return），此时补上收尾动作。
+///
+/// 不这么做的话，这些请求会留下永久 `in_flight = 1` 的行：
+/// `in_flight` 语义是「正在执行中」，永久停在 1 会让任何按该字段过滤的查询
+/// 看到幽灵请求，且这些行只能等 7 天保留策略清理。
 impl Drop for Lease {
     fn drop(&mut self) {
-        // 字段声明顺序决定 drop 顺序：先还全局再还渠道，与获取顺序相反
-        drop(self.global.take());
+        if let Some(g) = self.global.take() {
+            // 先 disarm 再交给 update_last_tokens：它内部会递减 ACTIVE，
+            // 守卫若仍上膛则会在随后 Drop 时再减一次，导致计数下溢。
+            let idx = g.disarm();
+            stats::update_last_tokens(idx, stats::TokenCounts::default());
+            if let Some(h) = APP_HANDLE.get() {
+                let _ = h.emit("stats-updated", ());
+            }
+        }
     }
 }
 
@@ -2173,22 +2371,25 @@ pub(crate) async fn acquire_lease() -> Result<Lease, String> {
         };
     };
 
-    // 全部渠道禁用：继续等待也不会好转，直接给出可读原因
-    let target = sched
-        .first_enabled_id()
-        .ok_or_else(|| "所有渠道均已禁用".to_string())?;
-    let gate = global_gate_max(sched);
-
     for _ in 0..600 {
-        if let Some(global) = try_acquire_pair(sched, &target, gate) {
-            // 凭据必须与所占槽位的渠道一致，避免两者取到不同渠道
-            let channel = channel_config(&target).unwrap_or_else(probe_channel);
-            return Ok(Lease {
-                profile_id: target.clone(),
-                channel,
-                global: Some(global),
-                channel_slot: ChannelSlotGuard::new(target),
-            });
+        // 每轮重新采样闸门并重新选路。曾经把目标锁定为 `first_enabled_id()`，
+        // 于是首个渠道一旦饱和且被探针/余额反复撞上，就会空等 120 秒后
+        // 报「并发已满」——而此时其它渠道可能完全空闲。
+        let gate = global_gate_max(sched);
+        if let Some(target) = sched.select_channel() {
+            if let Some(global) = try_acquire_pair(sched, &target, gate) {
+                // 凭据必须与所占槽位的渠道一致，避免两者取到不同渠道
+                let channel = channel_config(&target).unwrap_or_else(probe_channel);
+                return Ok(Lease {
+                    profile_id: target.clone(),
+                    channel,
+                    global: Some(global),
+                    channel_slot: ChannelSlotGuard::new(target),
+                });
+            }
+        } else if !sched.has_enabled_channel() {
+            // 全禁用：继续等待也不会好转，立即返回可读原因
+            return Err("所有渠道均已禁用".to_string());
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
@@ -2236,23 +2437,37 @@ fn too_many_requests(message: String) -> Response {
 
 /// 软并发调度：先由调度器选出可用渠道，再获取全局并发槽位与渠道并发槽位。
 /// 最长等待 120 秒；超时返回 429。
-/// 返回 (SlotGuard, profile_id)，profile_id 供调用方取该渠道的上游凭据。
-async fn wait_for_slot() -> Result<(stats::SlotGuard, String), Response> {
+///
+/// 返回的 `Lease` 按 `Drop` 归还两个槽位，调用方在任何路径提前返回
+/// （上游报错、格式转换失败等）都不会泄漏渠道槽位。
+async fn wait_for_slot() -> Result<Lease, Response> {
     // 调度器未初始化：降级为全局并发控制
     let Some(sched) = SCHEDULER.get() else {
         return match acquire_slot().await {
-            Some(g) => Ok((g, String::new())),
-            None => Err(too_many_requests(format!(
-                "并发请求已达上限（{MAX_CONCURRENCY}），排队等待 2 分钟仍未获取到槽位，请稍后重试"
-            ))),
+            Some(g) => Ok(Lease {
+                profile_id: String::new(),
+                channel: resolve_channel(""),
+                global: Some(g),
+                channel_slot: ChannelSlotGuard::none(),
+            }),
+            None => {
+                // 真实生效的上限是用户配置的 `max_concurrency`（口径同 `acquire_slot`），
+                // 不是某个硬编码常量；报错必须反映真实值，否则会误导排查方向。
+                let max = cfg().max_concurrency;
+                Err(too_many_requests(format!(
+                    "并发请求已达上限（{max}），排队等待 2 分钟仍未获取到槽位，请稍后重试"
+                )))
+            }
         };
     };
 
-    // 全局闸门取「已启用渠道并发之和」，否则大并发渠道会被小渠道上限卡住
-    let gate = global_gate_max(sched);
     let mut waited = false;
 
     for _ in 0..600 {
+        // 每轮重新采样全局闸门：AIMD 会随上游反馈收紧/放宽，
+        // 在循环外只取一次会让闸门陈旧最长 120 秒——降速后即使上限已恢复，
+        // 排队的请求仍被旧的小闸门卡住，吞吐被钉死在收紧时的值。
+        let gate = global_gate_max(sched);
         // 每轮重新选路，渠道释放后能重新被选中，而不是锁定首次选择
         if let Some(profile_id) = sched.select_channel() {
             if let Some(global) = try_acquire_pair(sched, &profile_id, gate) {
@@ -2262,7 +2477,15 @@ async fn wait_for_slot() -> Result<(stats::SlotGuard, String), Response> {
                 if let Some(h) = APP_HANDLE.get() {
                     let _ = h.emit("stats-updated", ());
                 }
-                return Ok((global, profile_id));
+                // 凭据必须与所占槽位的渠道一致，避免两者取到不同渠道
+                let channel = resolve_channel(&profile_id);
+                let channel_slot = ChannelSlotGuard::new(profile_id.clone());
+                return Ok(Lease {
+                    channel,
+                    profile_id,
+                    global: Some(global),
+                    channel_slot,
+                });
             }
         } else if !sched.has_enabled_channel() {
             // 无任何启用渠道：继续等待也不会好转，立即返回明确错误
@@ -2368,13 +2591,20 @@ async fn send_upstream(
 }
 
 /// 把上游（SSE）响应聚合为完整 chat.completion JSON，返回 (JSON, 输出字符数)。
-async fn aggregate_chat_completion(upstream: reqwest::Response, model: String) -> (Value, u64, stats::TokenCounts) {
+/// 把上游的 Responses SSE 流聚合为一个完整的 Chat Completions JSON。
+///
+/// 接受任意字节流而非 `reqwest::Response`：非流式路径可能已经把响应体读进了
+/// 内存（用于判断它是 JSON 还是 SSE），需要从字节重建流再走同一套聚合逻辑。
+async fn aggregate_chat_completion<S>(upstream: S, model: String) -> (Value, u64, stats::TokenCounts)
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin + Send + 'static,
+{
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(256);
     let (usage_tx, usage_rx) = tokio::sync::oneshot::channel::<stats::TokenCounts>();
     let model_producer = model.clone();
     tokio::spawn(async move {
         let (_, tool_used, usage) =
-            convert_stream(upstream.bytes_stream(), model_producer.clone(), &tx, None).await;
+            convert_stream(upstream, model_producer.clone(), &tx, None).await;
         let _ = usage_tx.send(usage);
         let finish = make_chunk(
             &model_producer,
@@ -2533,6 +2763,22 @@ async fn upstream_error_response(upstream: reqwest::Response) -> Response {
         .into_response()
 }
 
+/// 把上游状态反馈给调度器的 AIMD 自适应并发控制。
+///
+/// - 429 → 乘性降速：上游在说「打太快了」，立即收紧
+/// - 2xx → 加性提速：带冷却，逐步探回配置的天花板
+///
+/// 其余状态码不改变并发：4xx 多为参数问题、5xx 为上游自身故障，
+/// 把它们当成限流信号会让并发毫无依据地塌到下限。
+fn note_upstream_feedback(profile_id: &str, status: StatusCode) {
+    let Some(sched) = SCHEDULER.get() else { return };
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        sched.record_rate_limit(profile_id);
+    } else if status.is_success() {
+        sched.record_success(profile_id);
+    }
+}
+
 /// 模式 1：OpenAI 传统 Chat Completions（/v1/chat/completions）
 async fn chat_completions(
     State(_): State<()>,
@@ -2543,12 +2789,11 @@ async fn chat_completions(
     let wants_stream = chat_body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
     // 先选路：渠道的上游格式决定载荷如何转换，必须早于 payload 构造
-    let (guard, profile_id) = match wait_for_slot().await {
-        Ok(g) => g,
+    let mut lease = match wait_for_slot().await {
+        Ok(l) => l,
         Err(resp) => return resp,
     };
-    let _profile_id_for_stream = profile_id.clone();
-    let ch = resolve_channel(&profile_id);
+    let ch = lease.channel.clone();
     let upstream_fmt = ch.upstream_format;
 
     let (payload, to_responses) = match upstream_fmt {
@@ -2571,6 +2816,7 @@ async fn chat_completions(
         Ok(r) => r,
         Err((status, body)) => return (status, Json(body)).into_response(),
     };
+    note_upstream_feedback(&lease.profile_id, upstream.status());
 
     if !upstream.status().is_success() {
         return upstream_error_response(upstream).await;
@@ -2578,24 +2824,45 @@ async fn chat_completions(
 
     if !wants_stream {
         if to_responses {
-            // 上游返回 Responses 格式 -> 转为 Chat Completions
+            // 上游返回 Responses 格式 -> 转为 Chat Completions。
+            //
+            // 响应体可能是两种形态，必须都处理：
+            //  - SSE：`send_upstream` 恒定发送 `accept: text/event-stream`，
+            //    网关据此流式返回（实测线上网关即如此）；
+            //  - JSON：上游忽略 accept、直接返回完整对象。
+            // 曾只按 JSON 解析，遇到 SSE 时解析失败退化成 `json!({})`，
+            // 转出的 chat.completion 里 `content: null`、状态码却是 200 ——
+            // 非流式请求全部拿到空回复，客户端无法察觉。
             let full = upstream.text().await.unwrap_or_default();
-            let tc = match serde_json::from_str::<Value>(&full) {
-                Ok(v) => {
-                    let input = v.pointer("/usage/input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-                    let output = v.pointer("/usage/output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-                    let cached = v.pointer("/usage/cached_tokens").and_then(|t| t.as_u64())
+            let is_json = full.trim_start().starts_with('{');
+            let (cc, tc) = if is_json {
+                let v = serde_json::from_str::<Value>(&full).unwrap_or(json!({}));
+                let tc = stats::TokenCounts {
+                    input: v.pointer("/usage/input_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+                    output: v.pointer("/usage/output_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+                    cached: v.pointer("/usage/cached_tokens").and_then(|t| t.as_u64())
                         .or_else(|| v.pointer("/usage/input_tokens_details/cached_tokens").and_then(|t| t.as_u64()))
-                        .unwrap_or(0);
-                    stats::TokenCounts { input, output, cached }
-                }
-                Err(_) => stats::TokenCounts { input: 0, output: 0, cached: 0 },
+                        .unwrap_or(0),
+                };
+                (responses_to_chat_json(&v, &model), tc)
+            } else {
+                // 把已读入的响应体重新包成流，复用流式聚合逻辑
+                let bytes = bytes::Bytes::from(full.into_bytes());
+                let stream = futures_util::stream::iter(vec![
+                    Ok::<_, reqwest::Error>(bytes),
+                ]);
+                let (cc, chars, usage) = aggregate_chat_completion(stream, model.clone()).await;
+                let tc = if usage.input > 0 || usage.output > 0 {
+                    usage
+                } else {
+                    stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 }
+                };
+                (cc, tc)
             };
-            // 把 Responses JSON 转为 Chat Completions JSON
-            let cc = responses_to_chat_json(&serde_json::from_str::<Value>(&full).unwrap_or(json!({})), &model);
-            stats::update_tokens_db_only(guard.idx(), tc);
-            guard.release();
-            if let Some(sched) = SCHEDULER.get() { sched.release_slot(&profile_id); sched.record_request(&profile_id, 0); }
+            let total_tokens = tc.input + tc.output;
+            let idx = lease.disarm_global();
+            stats::update_last_tokens(idx, tc);
+            if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
             return (StatusCode::OK, Json(cc)).into_response();
         } else if upstream_fmt == UpstreamFormat::ChatCompletions {
@@ -2612,9 +2879,10 @@ async fn chat_completions(
                 }
                 Err(_) => stats::TokenCounts { input: 0, output: 0, cached: 0 },
             };
-            stats::update_tokens_db_only(guard.idx(), tc);
-            guard.release();
-            if let Some(sched) = SCHEDULER.get() { sched.release_slot(&profile_id); sched.record_request(&profile_id, 0); }
+            let total_tokens = tc.input + tc.output;
+            let idx = lease.disarm_global();
+            stats::update_last_tokens(idx, tc);
+            if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
             return Response::builder().status(StatusCode::OK)
                 .header("content-type", content_type)
@@ -2629,9 +2897,10 @@ async fn chat_completions(
                 cached: 0,
             };
             let cc = anthropic_json_to_chat(&v);
-            stats::update_tokens_db_only(guard.idx(), tc);
-            guard.release();
-            if let Some(sched) = SCHEDULER.get() { sched.release_slot(&profile_id); sched.record_request(&profile_id, 0); }
+            let total_tokens = tc.input + tc.output;
+            let idx = lease.disarm_global();
+            stats::update_last_tokens(idx, tc);
+            if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
             return (StatusCode::OK, Json(cc)).into_response();
         }
@@ -2640,7 +2909,10 @@ async fn chat_completions(
     // 流式：边读边转换，实时更新 token 数
     let byte_stream = upstream.bytes_stream();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(256);
-    let idx = guard.disarm();
+    // 守卫**移入** spawn 任务再释放：若这里就 disarm（放弃守卫的所有权），
+    // 任务一旦 panic 就没人再递减 ACTIVE，槽位永久泄漏。
+    let global_guard = lease.take_global_guard();
+    let idx = global_guard.as_ref().map(|g| g.idx()).unwrap_or(0);
 
     tokio::spawn(async move {
         let first = make_chunk(&model, json!({"role": "assistant"}), None);
@@ -2653,32 +2925,51 @@ async fn chat_completions(
         });
         let result = tokio::time::timeout(STREAM_TIMEOUT, async {
             if to_responses {
-                // 上游 Responses SSE -> Chat Completions SSE
-                convert_stream_chat_to_responses(byte_stream, model.clone(), &tx, Some(cb)).await
+                // 上游 Responses SSE -> Chat Completions SSE。
+                // 必须用 `convert_stream`（它解析 response.output_text.delta /
+                // response.usage 并产出 Chat chunk）。曾误用反方向的
+                // `convert_stream_chat_to_responses`，它只认 choices[].delta，
+                // 而 Responses 事件里没有该字段 —— 结果是流式对话返回空内容且
+                // 状态码 200，客户端完全无法察觉。
+                convert_stream(byte_stream, model.clone(), &tx, Some(cb)).await
             } else if upstream_fmt == UpstreamFormat::ChatCompletions {
                 // 上游 Chat SSE -> Chat SSE 直通
                 let (chars, tc) = passthrough_chat_stream(byte_stream, model.clone(), &tx, Some(cb)).await;
                 (chars, false, tc)
             } else {
                 // 上游 Anthropic SSE -> Chat SSE
-                let (_c, _used, tc) = convert_stream_anthropic_to_chat(byte_stream, model.clone(), &tx, Some(cb)).await;
-                (_c, false, tc)
+                let (_c, used, tc) = convert_stream_anthropic_to_chat(byte_stream, model.clone(), &tx, Some(cb)).await;
+                // 必须原样透传工具标志位：丢成 false 会让 finish_reason 恒为 "stop"，
+                // OpenAI 客户端据此认为模型自然结束，工具被静默丢弃。
+                (_c, used, tc)
             }
         }).await;
         let (chars, tool_used, upstream_usage) = match result {
             Ok(v) => v,
             Err(_) => { (0u64, false, stats::TokenCounts { input: 0, output: 0, cached: 0 }) }
         };
-        let finish = make_chunk(&model, json!({}), Some(if tool_used { "tool_calls" } else { "stop" }));
-        let _ = tx.send(Ok(sse_frame(&finish))).await;
-        let _ = tx.send(Ok(b"data: [DONE]\n\n".to_vec())).await;
-        drop(tx);
         let tc = if upstream_usage.input > 0 || upstream_usage.output > 0 { upstream_usage }
         else { stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 } };
-        let output_tokens = tc.output;
+        let total_tokens = tc.input + tc.output;
+        // 先完成统计与槽位归还，**再**做尾部发送。
+        //
+        // 尾部 send 在客户端停止读取（通道满）时会长时间阻塞，而它不在
+        // STREAM_TIMEOUT 保护内。若把释放排在发送之后，任务一旦卡住，
+        // 全局槽位与渠道槽位会随任务永久挂起，累积到上限后整个代理对
+        // **所有**请求返回「并发已满」。
+        //
+        // 守卫在此 disarm 后交给 update_last_tokens 统一归还；若上面任何一步
+        // panic，守卫仍上膛，随栈展开 Drop 时归还 —— 两条路都恰好减一次。
+        let idx = global_guard.map(|g| g.disarm()).unwrap_or(0);
         stats::update_last_tokens(idx, tc);
-        if let Some(sched) = SCHEDULER.get() { sched.release_slot(&_profile_id_for_stream); sched.record_request(&_profile_id_for_stream, output_tokens); }
+        if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
+        drop(lease); // 归还渠道槽位；此后不再使用 lease
         if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
+
+        let finish = make_chunk(&model, json!({}), Some(if tool_used { "tool_calls" } else { "stop" }));
+        // 有界发送：客户端已断开时最多多活 TAIL_SEND_TIMEOUT，而不是永久挂着
+        let _ = tokio::time::timeout(TAIL_SEND_TIMEOUT, tx.send(Ok(sse_frame(&finish)))).await;
+        let _ = tokio::time::timeout(TAIL_SEND_TIMEOUT, tx.send(Ok(b"data: [DONE]\n\n".to_vec()))).await;
     });
 
     sse_response(rx)
@@ -2693,11 +2984,11 @@ async fn responses_api(
     let user_agent = request_user_agent(&headers);
     let wants_stream = body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
-    let (guard, profile_id) = match wait_for_slot().await {
-        Ok(g) => g,
+    let mut lease = match wait_for_slot().await {
+        Ok(l) => l,
         Err(resp) => return resp,
     };
-    let ch = resolve_channel(&profile_id);
+    let ch = lease.channel.clone();
     let upstream_fmt = ch.upstream_format;
 
     // 按上游格式转换请求；模型强制覆盖取自选中渠道
@@ -2715,6 +3006,7 @@ async fn responses_api(
         Ok(r) => r,
         Err((status, err)) => return (status, Json(err)).into_response(),
     };
+    note_upstream_feedback(&lease.profile_id, upstream.status());
 
     if !upstream.status().is_success() {
         return upstream_error_response(upstream).await;
@@ -2753,9 +3045,10 @@ async fn responses_api(
                 stats::TokenCounts { input, output, cached: 0 }
             }
         };
-        stats::update_tokens_db_only(guard.idx(), tc);
-        guard.release();
-        if let Some(sched) = SCHEDULER.get() { sched.release_slot(&profile_id); sched.record_request(&profile_id, 0); }
+        let total_tokens = tc.input + tc.output;
+        let idx = lease.disarm_global();
+        stats::update_last_tokens(idx, tc);
+        if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
         if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
         return Response::builder().status(StatusCode::OK)
             .header("content-type", content_type)
@@ -2765,7 +3058,9 @@ async fn responses_api(
     // 流式：字节原样透传，同时旁路统计 output_text.delta 的字符数
     let byte_stream = upstream.bytes_stream();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(256);
-    let idx = guard.disarm();
+    // 守卫移入任务再释放，panic 时靠 Drop 归还（见 chat_completions 的说明）
+    let global_guard = lease.take_global_guard();
+    let idx = global_guard.as_ref().map(|g| g.idx()).unwrap_or(0);
     tokio::spawn(async move {
         let mut chars: u64 = 0;
         let mut usage = stats::TokenCounts { input: 0, output: 0, cached: 0 };
@@ -2782,8 +3077,8 @@ async fn responses_api(
                         let Ok(bytes) = next else { break };
                         if tx.send(Ok(bytes.to_vec())).await.is_err() { break; }
                         pending.extend_from_slice(&bytes);
-                        while let Some(pos) = find_double_newline(&pending) {
-                            let event_bytes: Vec<u8> = pending.drain(..pos + 2).collect();
+                        while let Some((end, delim)) = find_sse_boundary(&pending) {
+                            let event_bytes: Vec<u8> = pending.drain(..end + delim).collect();
                             let text = String::from_utf8_lossy(&event_bytes);
                             if let Some(data_line) = text.lines().rev().find(|l| l.trim_start().starts_with("data:")) {
                                 let payload_str = data_line.trim_start()["data:".len()..].trim();
@@ -2828,9 +3123,12 @@ async fn responses_api(
         drop(tx);
         let tc = if usage.input > 0 || usage.output > 0 { usage }
         else { stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 } };
-        let output_tokens = tc.output;
+        let total_tokens = tc.input + tc.output;
+        // 守卫 disarm 后交给 update_last_tokens；若上面 panic，守卫仍上膛，
+        // 随栈展开 Drop 时归还 —— 两条路都恰好减一次（见 chat_completions 说明）
+        let idx = global_guard.map(|g| g.disarm()).unwrap_or(0);
         stats::update_last_tokens(idx, tc);
-        if let Some(sched) = SCHEDULER.get() { sched.release_slot(&profile_id); sched.record_request(&profile_id, output_tokens); }
+        if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
         if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
     });
 
@@ -2847,11 +3145,11 @@ async fn anthropic_messages(
     let wants_stream = body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
     // 先选路：渠道的上游格式决定载荷如何转换，必须早于 payload 构造
-    let (guard, profile_id) = match wait_for_slot().await {
-        Ok(g) => g,
+    let mut lease = match wait_for_slot().await {
+        Ok(l) => l,
         Err(resp) => return resp,
     };
-    let ch = resolve_channel(&profile_id);
+    let ch = lease.channel.clone();
     let upstream_fmt = ch.upstream_format;
 
     let (payload, to_responses) = match upstream_fmt {
@@ -2874,6 +3172,7 @@ async fn anthropic_messages(
         Ok(r) => r,
         Err((status, err)) => return (status, Json(err)).into_response(),
     };
+    note_upstream_feedback(&lease.profile_id, upstream.status());
 
     if !upstream.status().is_success() {
         return upstream_error_response(upstream).await;
@@ -2882,12 +3181,14 @@ async fn anthropic_messages(
     if !wants_stream {
         if to_responses {
             // 上游返回 Responses 格式 -> 转为 Anthropic（复用现有 aggregate_chat_completion + chat_completion_to_anthropic）
-            let (cc, chars, upstream_usage) = aggregate_chat_completion(upstream, model).await;
+            let (cc, chars, upstream_usage) =
+                aggregate_chat_completion(upstream.bytes_stream(), model).await;
             let tc = if upstream_usage.input > 0 || upstream_usage.output > 0 { upstream_usage }
             else { stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 } };
-            stats::update_tokens_db_only(guard.idx(), tc.clone());
-            guard.release();
-            if let Some(sched) = SCHEDULER.get() { sched.release_slot(&profile_id); sched.record_request(&profile_id, 0); }
+            let total_tokens = tc.input + tc.output;
+            let idx = lease.disarm_global();
+            stats::update_last_tokens(idx, tc.clone());
+            if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
             return (StatusCode::OK, Json(chat_completion_to_anthropic(&cc, &tc))).into_response();
         } else {
@@ -2911,9 +3212,10 @@ async fn anthropic_messages(
                 };
                 (upstream_val, tc)
             };
-            stats::update_tokens_db_only(guard.idx(), tc);
-            guard.release();
-            if let Some(sched) = SCHEDULER.get() { sched.release_slot(&profile_id); sched.record_request(&profile_id, 0); }
+            let total_tokens = tc.input + tc.output;
+            let idx = lease.disarm_global();
+            stats::update_last_tokens(idx, tc);
+            if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
             return (StatusCode::OK, Json(anthropic_val)).into_response();
         }
@@ -2922,7 +3224,9 @@ async fn anthropic_messages(
     // 流式：转换为 Anthropic SSE 事件序列，实时更新 token 数
     let byte_stream = upstream.bytes_stream();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(256);
-    let idx = guard.disarm();
+    // 守卫移入任务再释放，panic 时靠 Drop 归还（见 chat_completions 的说明）
+    let global_guard = lease.take_global_guard();
+    let idx = global_guard.as_ref().map(|g| g.idx()).unwrap_or(0);
     tokio::spawn(async move {
         let cb: Box<dyn Fn(u64) + Send> = Box::new(move |chars: u64| {
             stats::update_tokens_db_only(idx, stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 });
@@ -2949,9 +3253,12 @@ async fn anthropic_messages(
         drop(tx);
         let tc = if upstream_usage.input > 0 || upstream_usage.output > 0 { upstream_usage }
         else { stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 } };
-        let output_tokens = tc.output;
+        let total_tokens = tc.input + tc.output;
+        // 守卫 disarm 后交给 update_last_tokens；若上面 panic，守卫仍上膛，
+        // 随栈展开 Drop 时归还 —— 两条路都恰好减一次（见 chat_completions 说明）
+        let idx = global_guard.map(|g| g.disarm()).unwrap_or(0);
         stats::update_last_tokens(idx, tc);
-        if let Some(sched) = SCHEDULER.get() { sched.release_slot(&profile_id); sched.record_request(&profile_id, output_tokens); }
+        if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
         if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
     });
 
@@ -3163,6 +3470,1311 @@ mod channel_routing_tests {
 
         sched.remove_channel("probe-ch");
         remove_channel_config("probe-ch");
+    }
+
+    /// 回归保护：上游返回 429（或任何非 2xx）时 handler 会提前返回。
+    /// 修复前这些早退路径漏了 `release_slot`，渠道槽位被永久占用：
+    /// 每来一次上游 429 就漏一个槽位，累积到渠道并发上限后该渠道
+    /// 从调度器候选中消失；而 `enabled` 仍为 true，请求不会快速失败，
+    /// 而是空等 120 秒后才拿到 429。单渠道部署下整个代理就此瘫痪。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upstream_429_releases_channel_slot() {
+        use tower::ServiceExt;
+
+        let _g = lock();
+        let sched = init_scheduler();
+
+        // 本地 mock 上游：一律返回 429，避免依赖外网
+        let upstream = Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({"error": {"message": "rate limited"}})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+
+        sched.upsert_channel("err-ch", true, 4, 0, 0, 100);
+        set_channel_config(
+            "err-ch",
+            ChannelConfig {
+                api_key: "sk-err".into(),
+                upstream_url: format!("http://{addr}/v1/responses"),
+                upstream_format: UpstreamFormat::Responses,
+                model_override: String::new(),
+            },
+        );
+
+        let resp = build_router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model": "m", "input": "hi"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "上游 429 应原样透传给客户端"
+        );
+        assert_eq!(
+            in_flight(sched, "err-ch"),
+            0,
+            "上游错误早退后渠道槽位未归还：渠道会被 429 逐步占死直到永久不可用"
+        );
+
+        // 429 必须反馈给调度器：否则上游在限流、本地却继续按配置上限猛打，
+        // 把一次限流放大成持续雪崩。
+        let limit = sched
+            .snapshot()
+            .iter()
+            .find(|c| c.profile_id == "err-ch")
+            .map(|c| c.effective_limit)
+            .unwrap();
+        assert_eq!(
+            limit, 3,
+            "429 未反馈给调度器：自适应上限应 4→3 收敛，实际 {limit}"
+        );
+
+        sched.remove_channel("err-ch");
+        remove_channel_config("err-ch");
+    }
+
+    /// 回归保护：非流式请求的 token 消耗曾按 0 计入 TPM 窗口，
+    /// 流式也只记输出部分，导致 `max_tpm` 远达不到配置的拦截效果。
+    /// 这里断言按 input + output 全量记账。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_streaming_request_records_input_and_output_tokens() {
+        use tower::ServiceExt;
+
+        let _g = lock();
+        let sched = init_scheduler();
+
+        // mock 上游：返回带 usage 的 Chat Completions 响应
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Json(json!({
+                    "id": "cmpl-1",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hi"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 50}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+
+        // max_tpm 设大：本用例只验证记账口径，不触发限流
+        sched.upsert_channel("tpm-ch", true, 4, 0, 1_000_000, 100);
+        set_channel_config(
+            "tpm-ch",
+            ChannelConfig {
+                api_key: "sk-tpm".into(),
+                upstream_url: format!("http://{addr}/v1/chat/completions"),
+                upstream_format: UpstreamFormat::ChatCompletions,
+                model_override: String::new(),
+            },
+        );
+
+        let resp = build_router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "mock 上游应返回成功");
+
+        let snap = sched.snapshot();
+        let ch = snap.iter().find(|c| c.profile_id == "tpm-ch").unwrap();
+        assert_eq!(
+            ch.current_tpm, 150,
+            "TPM 未按 input(100)+output(50) 全量记账，max_tpm 限额会形同虚设"
+        );
+
+        sched.remove_channel("tpm-ch");
+        remove_channel_config("tpm-ch");
+    }
+
+    /// 回归保护：非流式请求曾用 `update_tokens_db_only` 收尾，它只写 token 数、
+    /// **不写 `in_flight = 0`**，于是这些行永远停在 `in_flight = 1`，
+    /// 被 token 聚合（`WHERE in_flight = 0`）整体排除 —— 仪表盘的历史用量
+    /// 看不到任何非流式请求，而它们恰恰是大多数客户端的默认调用方式。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_streaming_usage_is_visible_in_stats_aggregation() {
+        use tower::ServiceExt;
+
+        let _g = lock();
+        let sched = init_scheduler();
+        // 用内存库，避免把伪造数据写进用户真实的统计文件
+        stats::use_memory_db_for_test();
+
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Json(json!({
+                    "id": "cmpl-agg",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hi"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 50}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+
+        sched.upsert_channel("agg-ch", true, 4, 0, 0, 100);
+        set_channel_config(
+            "agg-ch",
+            ChannelConfig {
+                api_key: "sk-agg".into(),
+                upstream_url: format!("http://{addr}/v1/chat/completions"),
+                upstream_format: UpstreamFormat::ChatCompletions,
+                model_override: String::new(),
+            },
+        );
+
+        let resp = build_router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // 非流式路径在返回响应前就完成收尾，读到 body 即代表落库已完成
+        let _ = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let total: u64 = stats::buckets(60)
+            .iter()
+            .map(|b| b.input_tokens + b.output_tokens)
+            .sum();
+        assert_eq!(
+            total, 150,
+            "非流式请求的 token 没进统计聚合：行停在 in_flight=1 被 WHERE 过滤掉了"
+        );
+
+        sched.remove_channel("agg-ch");
+        remove_channel_config("agg-ch");
+    }
+
+    /// 回归保护：流式路径的 TPM 记账口径。修复前流式只记输出、非流式记 0，
+    /// 两者都不能反映真实消耗。非流式已由上一个用例覆盖，这里补上**流式**这一缺口：
+    /// 断言流式请求结束后 TPM 按 mock 上游返回的 input + output 全量记账。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_request_records_input_and_output_tokens() {
+        use tower::ServiceExt;
+
+        let _g = lock();
+        let sched = init_scheduler();
+
+        // mock 上游：返回 Chat 格式 SSE（含 usage 的那一帧是记账依据）
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                let sse = concat!(
+                    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"He\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"llo\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50}}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    sse,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+
+        // max_tpm 设大：本用例只验证记账口径，不触发限流
+        sched.upsert_channel("sse-ch", true, 4, 0, 1_000_000, 100);
+        set_channel_config(
+            "sse-ch",
+            ChannelConfig {
+                api_key: "sk-sse".into(),
+                upstream_url: format!("http://{addr}/v1/chat/completions"),
+                upstream_format: UpstreamFormat::ChatCompletions,
+                model_override: String::new(),
+            },
+        );
+
+        let resp = build_router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "m",
+                            "stream": true,
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "mock 上游应返回成功");
+
+        // 必须把 SSE 响应体读到结束，否则流式任务的 tx 端会阻塞，统计永远不会写入
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("[DONE]"),
+            "流式响应未读到结尾，mock 上游的 SSE 没有被完整透传"
+        );
+
+        // 统计写在 spawn 出的流式任务里，存在真实竞态；但「渠道在飞并发归零」是确定性的同步点：
+        // 任务内的顺序是 update_last_tokens → record_request → 闭包结束（lease 在此 Drop 归还渠道槽位），
+        // 所以并发归零必然意味着 record_request 已经执行完，无需 sleep 硬猜时长。
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while in_flight(sched, "sse-ch") != 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            in_flight(sched, "sse-ch"),
+            0,
+            "等待流式任务归还渠道槽位超时，统计可能尚未写入"
+        );
+
+        let snap = sched.snapshot();
+        let ch = snap.iter().find(|c| c.profile_id == "sse-ch").unwrap();
+        assert_eq!(
+            ch.current_tpm, 150,
+            "流式 TPM 未按 input(100)+output(50) 全量记账，max_tpm 限额会形同虚设"
+        );
+
+        sched.remove_channel("sse-ch");
+        remove_channel_config("sse-ch");
+    }
+
+    /// 与上一条互补：若上游**忽略** `accept: text/event-stream` 而直接返回
+    /// 完整 JSON，也必须正确转换。修 SSE 分支时不能把 JSON 分支改坏。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_streaming_chat_with_responses_upstream_accepts_plain_json() {
+        use tower::ServiceExt;
+
+        let _g = lock();
+        let sched = init_scheduler();
+
+        let upstream = Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                Json(json!({
+                    "id": "resp_1",
+                    "object": "response",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "你好世界"}]
+                    }],
+                    "usage": {"input_tokens": 10, "output_tokens": 5}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+
+        sched.upsert_channel("json-ch", true, 4, 0, 0, 100);
+        set_channel_config(
+            "json-ch",
+            ChannelConfig {
+                api_key: "sk-json".into(),
+                upstream_url: format!("http://{addr}/v1/responses"),
+                upstream_format: UpstreamFormat::Responses,
+                model_override: String::new(),
+            },
+        );
+
+        let resp = build_router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
+        assert_eq!(
+            v.pointer("/choices/0/message/content").and_then(|c| c.as_str()),
+            Some("你好世界"),
+            "上游返回纯 JSON 时内容丢失：{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(
+            v.pointer("/usage/prompt_tokens").and_then(|t| t.as_u64()),
+            Some(10),
+            "JSON 分支的 usage 未正确透传"
+        );
+
+        sched.remove_channel("json-ch");
+        remove_channel_config("json-ch");
+    }
+
+    /// 回归保护：**非流式**请求打 Responses 上游时，上游仍可能按
+    /// `accept: text/event-stream`（`send_upstream` 恒定发送该头）返回 SSE ——
+    /// 但这条分支把响应体当 JSON 解析，解析失败就退化成 `json!({})`，
+    /// 转出来的 chat.completion 里 `content: null`，HTTP 状态码却是 200。
+    ///
+    /// 这不是推测：线上实例 `POST /v1/chat/completions`（不带 stream）
+    /// 实测返回 `{"message":{"content":null,"role":"assistant"}}`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_streaming_chat_with_responses_upstream_returns_content() {
+        use tower::ServiceExt;
+
+        let _g = lock();
+        let sched = init_scheduler();
+
+        // 上游对非流式请求也返回 SSE —— 这正是线上网关的行为
+        const SSE: &str = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"世界\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let upstream = Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    SSE,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+
+        sched.upsert_channel("ns-ch", true, 4, 0, 0, 100);
+        set_channel_config(
+            "ns-ch",
+            ChannelConfig {
+                api_key: "sk-ns".into(),
+                upstream_url: format!("http://{addr}/v1/responses"),
+                upstream_format: UpstreamFormat::Responses,
+                model_override: String::new(),
+            },
+        );
+
+        // 注意：不带 stream（或显式 false）—— 走非流式路径
+        let resp = build_router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "m",
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
+        let content = v.pointer("/choices/0/message/content");
+
+        assert_eq!(
+            content.and_then(|c| c.as_str()),
+            Some("你好世界"),
+            "非流式请求 + Responses 上游返回了空内容（上游以 SSE 返回，却被当 JSON 解析）。\
+             实际响应：{}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        sched.remove_channel("ns-ch");
+        remove_channel_config("ns-ch");
+    }
+
+    /// 回归保护：`to_responses` 分支曾调用**反方向**的转换器
+    /// （`convert_stream_chat_to_responses` 只解析 `choices[].delta`），
+    /// 而 Responses 上游的事件里根本没有该字段 —— 结果是流式对话返回**空内容**，
+    /// 状态码却是 200，客户端完全无法察觉。这是默认配置下的主路径。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_chat_with_responses_upstream_returns_content() {
+        use tower::ServiceExt;
+
+        let _g = lock();
+        let sched = init_scheduler();
+
+        // Responses 格式的 SSE：内容藏在 response.output_text.delta 里
+        const SSE: &str = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"世界\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let upstream = Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    SSE,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+
+        sched.upsert_channel("resp-ch", true, 4, 0, 0, 100);
+        set_channel_config(
+            "resp-ch",
+            ChannelConfig {
+                api_key: "sk-resp".into(),
+                upstream_url: format!("http://{addr}/v1/responses"),
+                upstream_format: UpstreamFormat::Responses,
+                model_override: String::new(),
+            },
+        );
+
+        let resp = build_router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "m",
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+
+        assert!(
+            body.contains("你好") && body.contains("世界"),
+            "流式 Chat + Responses 上游返回了空内容（转换器方向接反）。实际响应体：{body}"
+        );
+
+        sched.remove_channel("resp-ch");
+        remove_channel_config("resp-ch");
+    }
+
+    /// 回归保护：Chat 上游 + `/v1/messages` 流式的工具调用路径曾**整体失效**——
+    /// 工具块从不发 `content_block_stop`、`stop_reason` 恒为 `end_turn`
+    /// （源码里写成 `if usage.output > 0 { "end_turn" } else { "end_turn" }` 的恒真式），
+    /// 且 `input_json_delta` 用「最后分配的索引」而非该工具自己的索引。
+    /// 客户端表现为工具被静默丢弃、或并行工具参数互相串味。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_anthropic_with_chat_upstream_emits_complete_tool_calls() {
+        use tower::ServiceExt;
+
+        let _g = lock();
+        let sched = init_scheduler();
+
+        // 用 json! 构造再序列化，避免手写多层转义出错。
+        // 两个并行工具调用，参数分片交错到达——这正是 index 映射会被考验的地方。
+        let frame_a = json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"call_a","function":{"name":"get_weather","arguments":""}},
+            {"index":1,"id":"call_b","function":{"name":"get_stock","arguments":""}}
+        ]}}]}).to_string();
+        let frame_b = json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"function":{"arguments":"{\"city\":"}},
+            {"index":1,"function":{"arguments":"{\"sym\":"}}
+        ]}}]}).to_string();
+        let sse: &'static str =
+            Box::leak(format!("data: {frame_a}\n\ndata: {frame_b}\n\ndata: [DONE]\n\n").into_boxed_str());
+
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move || async move {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    sse,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+
+        sched.upsert_channel("tool-ch", true, 4, 0, 0, 100);
+        set_channel_config(
+            "tool-ch",
+            ChannelConfig {
+                api_key: "sk-tool".into(),
+                upstream_url: format!("http://{addr}/v1/chat/completions"),
+                upstream_format: UpstreamFormat::ChatCompletions,
+                model_override: String::new(),
+            },
+        );
+
+        let resp = build_router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "m",
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        let events: Vec<Value> = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|p| serde_json::from_str::<Value>(p).ok())
+            .collect();
+        assert!(!events.is_empty(), "未解析到任何 SSE 事件：{body}");
+
+        // 1) 每个已打开的块都必须闭合
+        let starts: Vec<i64> = events
+            .iter()
+            .filter(|e| e["type"] == "content_block_start")
+            .filter_map(|e| e["index"].as_i64())
+            .collect();
+        let stops: Vec<i64> = events
+            .iter()
+            .filter(|e| e["type"] == "content_block_stop")
+            .filter_map(|e| e["index"].as_i64())
+            .collect();
+        assert_eq!(starts.len(), 2, "应打开两个工具块，实际 {starts:?}");
+        for i in &starts {
+            assert!(
+                stops.contains(i),
+                "块 {i} 缺少 content_block_stop，Anthropic SDK 无法解析工具调用"
+            );
+        }
+
+        // 2) 并行工具的参数必须各归各的块，且索引不得下溢
+        let json_deltas: Vec<(i64, String)> = events
+            .iter()
+            .filter(|e| e["type"] == "content_block_delta")
+            .filter(|e| e["delta"]["type"] == "input_json_delta")
+            .filter_map(|e| {
+                Some((
+                    e["index"].as_i64()?,
+                    e["delta"]["partial_json"].as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        let city = json_deltas.iter().find(|(_, j)| j.contains("city"));
+        let sym = json_deltas.iter().find(|(_, j)| j.contains("sym"));
+        let (city, sym) = (city.expect("缺少 city 参数分片"), sym.expect("缺少 sym 参数分片"));
+        assert_ne!(
+            city.0, sym.0,
+            "两个并行工具的参数被打到同一个块上，客户端会拿到非法 JSON"
+        );
+
+        // 3) 有工具调用时必须报 tool_use
+        let stop = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .and_then(|e| e["delta"]["stop_reason"].as_str())
+            .unwrap_or("");
+        assert_eq!(
+            stop, "tool_use",
+            "有工具调用却报 end_turn，客户端会认为模型自然结束、不执行工具"
+        );
+
+        sched.remove_channel("tool-ch");
+        remove_channel_config("tool-ch");
+    }
+
+    /// 回归保护：Anthropic 上游 + `/v1/chat/completions` 流式的工具调用曾有
+    /// 两处缺陷——`tool_calls[].index` 硬编码 0（并行工具全部塌缩成一个、
+    /// 参数互相拼接成非法 JSON），以及调用方把工具标志位丢成 `false`
+    /// （`finish_reason` 恒为 `stop`，客户端不执行工具）。
+    ///
+    /// 用例特意在前面放一个**文本块**：Anthropic 的 index 空间同时包含文本与
+    /// 工具块，所以上遊 index 1/2 必须映射成 Chat tool_calls 索引 0/1，
+    /// 直接照搬上游 index 也是错的。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_chat_with_anthropic_upstream_keeps_parallel_tool_indices() {
+        use tower::ServiceExt;
+
+        let _g = lock();
+        let sched = init_scheduler();
+
+        let frames = [
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_a","name":"get_weather","input":{}}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\":"}}),
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_b","name":"get_stock","input":{}}}),
+            json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"sym\":"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+            json!({"type":"message_stop"}),
+        ];
+        let sse: &'static str = Box::leak(
+            frames
+                .iter()
+                .map(|f| format!("data: {f}\n\n"))
+                .collect::<String>()
+                .into_boxed_str(),
+        );
+
+        let upstream = Router::new().route(
+            "/v1/messages",
+            post(move || async move {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    sse,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+
+        sched.upsert_channel("anth-ch", true, 4, 0, 0, 100);
+        set_channel_config(
+            "anth-ch",
+            ChannelConfig {
+                api_key: "sk-anth".into(),
+                upstream_url: format!("http://{addr}/v1/messages"),
+                upstream_format: UpstreamFormat::Anthropic,
+                model_override: String::new(),
+            },
+        );
+
+        let resp = build_router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "m",
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        let events: Vec<Value> = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|p| serde_json::from_str::<Value>(p).ok())
+            .collect();
+
+        assert!(body.contains("hi"), "正文未透传：{body}");
+
+        let mut named: Vec<(String, i64)> = Vec::new();
+        let mut args: Vec<(String, i64)> = Vec::new();
+        for e in &events {
+            let Some(tc) = e["choices"][0]["delta"]["tool_calls"]
+                .as_array()
+                .and_then(|a| a.first())
+            else {
+                continue;
+            };
+            let idx = tc["index"].as_i64().unwrap_or(-1);
+            if let Some(n) = tc["function"]["name"].as_str().filter(|n| !n.is_empty()) {
+                named.push((n.to_string(), idx));
+            }
+            if let Some(a) = tc["function"]["arguments"].as_str().filter(|a| !a.is_empty()) {
+                args.push((a.to_string(), idx));
+            }
+        }
+
+        assert_eq!(named.len(), 2, "应声明两个工具，实际 {named:?}");
+        assert_eq!(named[0].1, 0, "第一个工具应拿到 Chat 索引 0，实际 {named:?}");
+        assert_eq!(
+            named[1].1, 1,
+            "第二个工具应与第一个分开（上游 index 2 应映射为 Chat 索引 1），实际 {named:?}"
+        );
+
+        let city = args.iter().find(|(a, _)| a.contains("city")).expect("缺 city 分片");
+        let sym = args.iter().find(|(a, _)| a.contains("sym")).expect("缺 sym 分片");
+        assert_eq!(city.1, 0, "city 参数打到了错误的工具索引，客户端会拿到非法 JSON");
+        assert_eq!(sym.1, 1, "sym 参数打到了错误的工具索引，客户端会拿到非法 JSON");
+
+        let finish = events
+            .iter()
+            .find_map(|e| e["choices"][0]["finish_reason"].as_str());
+        assert_eq!(
+            finish,
+            Some("tool_calls"),
+            "有工具调用却报 stop，OpenAI 客户端会跳过工具执行"
+        );
+
+        sched.remove_channel("anth-ch");
+        remove_channel_config("anth-ch");
+    }
+
+    /// `find_sse_boundary` 必须识别 SSE 规范允许的全部三种行结束符
+    /// （`\n` / `\r\n` / `\r`）及其混合形式。
+    /// 只认 `\n\n` 时，CRLF 上游会让帧边界**永远找不到**。
+    #[test]
+    fn sse_boundary_handles_all_line_endings() {
+        // (输入, 期望分隔符起点, 期望分隔符长度)
+        let cases: &[(&[u8], usize, usize)] = &[
+            (b"data: {}\n\nnext", 8, 2),
+            (b"data: {}\r\n\r\nnext", 8, 4),
+            (b"data: {}\r\rnext", 8, 2),
+            (b"data: {}\r\n\nnext", 8, 3),
+            (b"data: {}\n\r\nnext", 8, 3),
+        ];
+        for (input, want_start, want_len) in cases {
+            assert_eq!(
+                find_sse_boundary(input),
+                Some((*want_start, *want_len)),
+                "帧边界解析错误：{:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+
+        // 未完成的帧不能被当作边界，否则会截断正在到达的事件
+        assert_eq!(find_sse_boundary(b"data: {}\n"), None, "单个行结束符不是空行");
+        assert_eq!(find_sse_boundary(b"data: {}"), None);
+    }
+
+    /// 回归保护：CRLF 分帧的上游曾导致**转换路径整段丢失内容**——
+    /// 帧边界永远找不到，客户端收到 HTTP 200 却只有骨架帧。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn crlf_framed_upstream_still_delivers_content() {
+        use tower::ServiceExt;
+
+        let _g = lock();
+        let sched = init_scheduler();
+
+        // 与 LF 用例等价的内容，但用 CRLF 作为行结束符
+        const SSE: &str = concat!(
+            "event: response.output_text.delta\r\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}\r\n\r\n",
+            "event: response.output_text.delta\r\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"世界\"}\r\n\r\n",
+            "data: [DONE]\r\n\r\n",
+        );
+
+        let upstream = Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    SSE,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+
+        sched.upsert_channel("crlf-ch", true, 4, 0, 0, 100);
+        set_channel_config(
+            "crlf-ch",
+            ChannelConfig {
+                api_key: "sk-crlf".into(),
+                upstream_url: format!("http://{addr}/v1/responses"),
+                upstream_format: UpstreamFormat::Responses,
+                model_override: String::new(),
+            },
+        );
+
+        let resp = build_router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "m",
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains("你好") && body.contains("世界"),
+            "CRLF 分帧的上游导致内容整段丢失（帧边界识别不到）。实际响应体：{body}"
+        );
+
+        sched.remove_channel("crlf-ch");
+        remove_channel_config("crlf-ch");
+    }
+
+    /// 端到端验证**换端口成功**的完整流程（此前只测了失败路径）：
+    /// 在新端口上确实能收到 HTTP 响应，且旧端口已停止监听。
+    ///
+    /// 用真实 HTTP 请求而不是只看 `SERVER` 是否存在——后者无法发现
+    /// 「服务注册了但实际没在监听」这类问题。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn switching_port_moves_listener_to_new_port() {
+        let _g = lock();
+
+        // restart_server 会更新 CONFIG.port，cfg() 读取它做断言
+        *CONFIG.write().unwrap_or_else(|e| e.into_inner()) = Some(ProxyConfig {
+            api_key: String::new(),
+            model_override: String::new(),
+            port: 0,
+            upstream_url: String::new(),
+            max_concurrency: 20,
+            upstream_format: UpstreamFormat::Responses,
+        });
+
+        // 取一个空闲端口：与 restart_server 一样绑 0.0.0.0，再释放供其使用
+        let pick_free_port = || {
+            let l = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        let port_a = pick_free_port();
+        let port_b = pick_free_port();
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        // 1. 在 port_a 启动，确认真的能提供服务
+        restart_server(port_a).await.expect("port_a 应能启动");
+        let r = client
+            .get(format!("http://127.0.0.1:{port_a}/health"))
+            .send()
+            .await
+            .expect("port_a 上应能收到响应");
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.text().await.unwrap(), "ok");
+
+        // 2. 换到 port_b
+        restart_server(port_b).await.expect("换到 port_b 应成功");
+
+        // 3. 新端口必须能服务
+        let r = client
+            .get(format!("http://127.0.0.1:{port_b}/health"))
+            .send()
+            .await
+            .expect("换端口后新端口应能收到响应");
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.text().await.unwrap(), "ok");
+
+        // 4. 旧端口必须已经停止监听（优雅关闭是异步的，给一点时间）
+        let mut still_alive = true;
+        for _ in 0..20 {
+            if client
+                .get(format!("http://127.0.0.1:{port_a}/health"))
+                .send()
+                .await
+                .is_err()
+            {
+                still_alive = false;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            !still_alive,
+            "换端口后旧端口仍在监听：两个实例并存会重复计费/重复转发"
+        );
+
+        // 5. 配置里的端口也应已更新
+        assert_eq!(cfg().port, port_b, "换端口后配置未同步");
+
+        // 清理
+        if let Some(h) = SERVER.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = h.shutdown.send(true);
+        }
+    }
+
+    /// 回归保护：探针 / 余额通过 `acquire_lease()` 走同一条闸门，
+    /// `try_acquire` 会 INSERT 一行；但它们从不调用 `update_last_tokens`，
+    /// 于是行永久停在 `in_flight = 1` —— 不进入 token 聚合、
+    /// 只能等 7 天保留策略清理、任何按该字段过滤的查询都会看到幽灵请求。
+    ///
+    /// 现在由 `Lease::Drop` 统一兜底收尾，调用方无需记得手动处理。
+    #[test]
+    fn dropped_lease_completes_its_request_row() {
+        let _g = lock();
+        let sched = init_scheduler();
+        stats::use_memory_db_for_test();
+        sched.upsert_channel("f9-ch", true, 4, 0, 0, 100);
+        set_channel_config("f9-ch", mk_config("sk-9", "https://f9.example.com"));
+
+        let before = stats::in_flight_row_count_for_test();
+        let lease = test_rt().block_on(acquire_lease()).expect("应能取到租约");
+        assert_eq!(
+            stats::in_flight_row_count_for_test(),
+            before + 1,
+            "前置条件：租约应登记一行 in_flight = 1"
+        );
+
+        // 模拟探针/余额的用法：拿到租约、用完直接丢弃，不做任何手动收尾
+        drop(lease);
+
+        assert_eq!(
+            stats::in_flight_row_count_for_test(),
+            before,
+            "租约释放后行仍停在 in_flight = 1：探针/余额会不断累积幽灵行"
+        );
+
+        sched.remove_channel("f9-ch");
+        remove_channel_config("f9-ch");
+    }
+
+    /// 回归保护：流式路径曾用 `disarm_global()` 把全局守卫**提前摘掉**，
+    /// 释放责任全交给 spawn 任务末尾的 `update_last_tokens`。
+    /// 任务一旦 panic，就没人再递减 ACTIVE，槽位永久泄漏。
+    ///
+    /// 现在守卫被移入任务、保持上膛，panic 时随栈展开归还。
+    /// （端到端触发 panic 没有稳定入口，这里直接验证该机制本身。）
+    #[test]
+    fn armed_guard_is_released_even_on_panic() {
+        let _g = lock();
+        stats::use_memory_db_for_test();
+
+        let rowid = stats::try_acquire(u64::MAX).expect("应能取到槽位");
+        assert!(rowid > 0, "前置条件：内存库应就绪");
+        let held = stats::active();
+
+        // 守卫上膛并被 panic 打断：Drop 必须在栈展开时归还槽位
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = stats::SlotGuard::new(rowid);
+            panic!("模拟流式任务 panic");
+        }));
+        assert!(caught.is_err(), "前置条件：闭包应 panic");
+
+        assert_eq!(
+            stats::active(),
+            held - 1,
+            "panic 后全局槽位未归还：ACTIVE 只增不减，累积到上限后整个代理会假死"
+        );
+    }
+
+    /// `take_global_guard` 交出的守卫必须**仍是上膛**的：
+    /// 若它已被 disarm，panic 时就没人归还槽位，与修复前无异。
+    #[test]
+    fn taken_guard_stays_armed_until_explicitly_released() {
+        let _g = lock();
+        stats::use_memory_db_for_test();
+
+        let rowid = stats::try_acquire(u64::MAX).expect("应能取到槽位");
+        let held = stats::active();
+
+        let mut lease = Lease {
+            profile_id: "armed".into(),
+            channel: mk_config("sk", "https://x.example.com"),
+            global: Some(stats::SlotGuard::new(rowid)),
+            channel_slot: ChannelSlotGuard::none(),
+        };
+
+        let guard = lease.take_global_guard().expect("应取出守卫");
+        assert_eq!(stats::active(), held, "取出守卫不应立即释放槽位");
+
+        // 显式 disarm（正常收尾路径）
+        let idx = guard.disarm();
+        assert_eq!(idx, rowid, "disarm 应归还原始 rowid");
+        stats::update_last_tokens(idx, stats::TokenCounts::default());
+        assert_eq!(stats::active(), held - 1, "正常收尾应归还一次");
+
+        // 租约此时已不持有全局守卫，Drop 不得再减一次（否则计数下溢）
+        drop(lease);
+        assert_eq!(
+            stats::active(),
+            held - 1,
+            "重复释放导致 ACTIVE 下溢：并发上限会被虚高放行"
+        );
+    }
+
+    /// 回归保护：代理启动失败曾只写 stderr，而 release 构建带
+    /// `windows_subsystem = "windows"`、没有控制台 —— 用户看到窗口和托盘都正常，
+    /// 却没有任何监听，只能在客户端连不上时才发现。
+    /// 失败原因必须留在进程内供界面读取，并在成功后清空（避免过期告警常驻）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn server_failure_is_recorded_and_cleared_on_success() {
+        let _g = lock();
+
+        *CONFIG.write().unwrap_or_else(|e| e.into_inner()) = Some(ProxyConfig {
+            api_key: String::new(),
+            model_override: String::new(),
+            port: 0,
+            upstream_url: String::new(),
+            max_concurrency: 20,
+            upstream_format: UpstreamFormat::Responses,
+        });
+
+        // 清掉可能来自其它用例的状态
+        if let Some(h) = SERVER.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = h.shutdown.send(true);
+        }
+        set_last_server_error(None);
+
+        // 占住一个端口（绑 0.0.0.0，与 restart_server 一致）
+        let squatter = std::net::TcpListener::bind("0.0.0.0:0").expect("应能占住端口");
+        let occupied = squatter.local_addr().unwrap().port();
+
+        // 失败：必须记录原因，且不能谎报为在监听
+        let err = restart_server(occupied).await.expect_err("被占用应失败");
+        assert!(
+            last_server_error().is_some_and(|m| m.contains("监听失败")),
+            "启动失败未记录原因，界面无从告知用户（实际错误：{err}）"
+        );
+        assert!(
+            !is_listening(),
+            "绑定失败却报告为在监听，用户会以为代理可用"
+        );
+
+        // 成功：必须清空错误，避免过期告警常驻
+        let free = {
+            let l = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        restart_server(free).await.expect("空闲端口应成功");
+        assert!(
+            last_server_error().is_none(),
+            "启动成功后错误未清空，界面会一直显示过期告警"
+        );
+        assert!(is_listening(), "启动成功后应报告为在监听");
+
+        if let Some(h) = SERVER.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = h.shutdown.send(true);
+        }
+        set_last_server_error(None);
+    }
+
+    /// 回归保护：`restart_server` 曾「先停旧服务，再绑定新端口」。
+    /// 绑定失败时旧服务已经停掉、`SERVER` 已被取空 —— 代理彻底掉线，
+    /// 而调用方此时已把坏端口落盘，重启也起不来。
+    ///
+    /// 这里验证关键性质：**绑定失败不得影响正在运行的服务**。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_port_rebind_keeps_existing_server_alive() {
+        let _g = lock();
+
+        // 防御性清理：避免上一个用例异常退出留下的服务影响判断
+        if let Some(h) = SERVER.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = h.shutdown.send(true);
+        }
+
+        // 占住一个端口，模拟「已被其它程序占用」。
+        // 必须绑通配地址 0.0.0.0，与 restart_server 的绑定方式一致——
+        // 只绑 127.0.0.1 的话，Windows 允许 0.0.0.0 的通配绑定与之共存，
+        // 构不成真正的占用。
+        let squatter = std::net::TcpListener::bind("0.0.0.0:0").expect("应能占住端口");
+        let occupied = squatter.local_addr().unwrap().port();
+
+        // 先在一个空闲端口上正常启动。listener 取到端口号后立即释放，
+        // 以便 restart_server 能重新绑定它。
+        let free = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        restart_server(free).await.expect("空闲端口应能启动");
+        assert!(
+            SERVER.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
+            "前置条件：服务应已在运行"
+        );
+
+        // 切到被占用的端口 → 必须失败，且不能动到正在跑的服务
+        let err = restart_server(occupied)
+            .await
+            .expect_err("被占用的端口不应绑定成功");
+        assert!(err.contains("监听失败"), "错误信息应说明绑定失败，实际：{err}");
+
+        assert!(
+            SERVER.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
+            "绑定失败后旧服务被停掉了：代理会彻底掉线，而调用方已把坏端口落盘，重启也起不来"
+        );
+
+        // 清理：停掉本用例启动的服务
+        if let Some(h) = SERVER.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = h.shutdown.send(true);
+        }
+    }
+
+    /// 流式语义：`disarm_global()` 摘除全局槽位（其释放移交给 `update_last_tokens`），
+    /// 但渠道槽位仍必须在任务结束时归还，否则长连接一旦结束就漏一个槽位。
+    #[test]
+    fn disarmed_lease_still_releases_channel_slot() {
+        let _g = lock();
+        let sched = init_scheduler();
+        sched.upsert_channel("d-ch", true, 4, 0, 0, 100);
+        assert!(sched.acquire_slot("d-ch"));
+
+        let mut lease = Lease {
+            profile_id: "d-ch".into(),
+            channel: mk_config("sk-d", "https://d.example.com"),
+            // idx=5 仅用于验证「摘除后确实交还了 rowid」。
+            // disarm 只清 armed 标志，不触碰 ACTIVE 计数器，故不会污染全局计数。
+            global: Some(stats::SlotGuard::new(5)),
+            channel_slot: ChannelSlotGuard::new("d-ch".into()),
+        };
+        assert_eq!(
+            lease.disarm_global(),
+            5,
+            "disarm_global 应摘除并交还全局槽位 rowid，否则 Drop 会与 update_last_tokens 重复递减"
+        );
+
+        drop(lease);
+        assert_eq!(
+            in_flight(sched, "d-ch"),
+            0,
+            "流式任务结束后渠道槽位未归还，渠道会被逐步占死"
+        );
+
+        sched.remove_channel("d-ch");
+    }
+
+    /// 回归保护：探针 / 余额的租约曾锁定 `first_enabled_id()`，首个渠道一旦饱和，
+    /// 即便其它渠道完全空闲，也会空等 120 秒后报「并发已满」——用户看到
+    /// 「连接测试失败」，而实际上游健康。
+    #[test]
+    fn probe_lease_falls_back_to_an_available_channel() {
+        let _g = lock();
+        let sched = init_scheduler();
+
+        // pin-a 容量 1 且已被占满；pin-b 空闲
+        sched.upsert_channel("pin-a", true, 1, 0, 0, 100);
+        sched.upsert_channel("pin-b", true, 5, 0, 0, 100);
+        // 注册凭据，避免走到读全局 CONFIG 的降级分支
+        set_channel_config("pin-b", mk_config("sk-b", "https://b.example.com"));
+        assert!(sched.acquire_slot("pin-a"), "前置条件：占满 pin-a");
+
+        let lease = test_rt()
+            .block_on(acquire_lease())
+            .expect("首个渠道饱和时，探针应能改用其它可用渠道，而不是空等 120 秒");
+        assert_eq!(
+            lease.profile_id, "pin-b",
+            "租约锁定在了饱和渠道上，探针会一直失败"
+        );
+
+        drop(lease);
+        sched.remove_channel("pin-a");
+        sched.remove_channel("pin-b");
+        remove_channel_config("pin-b");
     }
 
     /// 全部渠道禁用时，探针应立刻拿到可读原因，而不是空等 120 秒

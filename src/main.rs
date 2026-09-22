@@ -1,7 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod balance;
-mod codeg;
 mod probe;
 mod proxy;
 mod scheduler;
@@ -19,14 +18,27 @@ use tauri::{
 
 // ──────── Profile 数据结构 ────────
 
+/// 渠道配置。
+///
+/// **除 `id` 外全部字段都带 serde 默认值**：历史版本写入的配置文件只包含
+/// 一部分字段（线上升级实例实测只有 id / name / upstream_url / api_key /
+/// model_override / max_concurrency 六个键），缺少任何一个必填字段都会让该渠道
+/// 解析失败、在界面上凭空消失。缺失字段应回落到可用的默认值，而不是丢数据。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Profile {
+    /// 唯一标识，缺失则无法注册到调度器，因此保持必填
     id: String,
+    #[serde(default)]
     name: String,
+    #[serde(default)]
     upstream_url: String,
+    #[serde(default)]
     api_key: String,
+    #[serde(default)]
     model_override: String,
+    #[serde(default = "default_max_concurrency")]
     max_concurrency: usize,
+    #[serde(default = "default_upstream_format")]
     upstream_format: String,
     #[serde(default = "default_enabled")]
     enabled: bool,
@@ -44,6 +56,16 @@ fn default_enabled() -> bool {
 
 fn default_weight() -> u32 {
     100
+}
+
+/// 与前端新建渠道时的默认值保持一致
+fn default_max_concurrency() -> usize {
+    20
+}
+
+/// 与 `UpstreamFormat::from_str("")` 的回落一致（Responses）
+fn default_upstream_format() -> String {
+    "responses".to_string()
 }
 
 impl Default for Profile {
@@ -165,6 +187,9 @@ fn get_server_info() -> serde_json::Value {
             "/v1/messages",
         ],
         "model_override": model_override,
+        // release 构建无控制台，服务没起来必须让界面能看出来
+        "listening": proxy::is_listening(),
+        "error": proxy::last_server_error(),
     })
 }
 
@@ -210,62 +235,9 @@ pub(crate) fn app_data_override() -> Option<std::path::PathBuf> {
 }
 
 fn save_port(port: u16) -> Result<(), String> {
-    let path = config_path().ok_or("无法确定配置文件路径")?;
-    let mut v: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    v["port"] = json!(port);
-    std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap())
-        .map_err(|e| format!("写入配置失败：{e}"))?;
-    println!("saved port {} to {}", port, path.display());
+    update_config_value(|v| v["port"] = json!(port))?;
+    println!("saved port {}", port);
     Ok(())
-}
-
-#[derive(serde::Serialize)]
-struct CodegSettingsResponse {
-    config: codeg::CodegConfig,
-}
-
-/// 获取 Codeg 服务器设置
-#[tauri::command]
-fn get_codeg_settings() -> CodegSettingsResponse {
-    let cfg = parse_saved_config(codeg::load_from_json);
-    CodegSettingsResponse { config: cfg }
-}
-
-/// 保存 Codeg 服务器设置并热更新运行时，不阻塞应用启动
-#[tauri::command]
-fn set_codeg_settings(config: codeg::CodegConfig) -> Result<CodegSettingsResponse, String> {
-    let path = config_path().ok_or("无法确定配置文件路径")?;
-    let mut v: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    codeg::save_to_json(&mut v, &config);
-    std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap())
-        .map_err(|e| format!("写入配置失败：{e}"))?;
-    let saved = codeg::update_config(config);
-    if let Some(handle) = proxy::app_handle() {
-        let _ = handle.emit("codeg-settings-changed", ());
-    }
-    Ok(CodegSettingsResponse { config: saved })
-}
-
-/// 获取 Codeg 实时状态：会话数量、运行/停止/等待输入、活跃名称、进程与资源占用
-#[tauri::command]
-async fn get_codeg_status() -> Result<codeg::CodegStatus, String> {
-    codeg::codeg_status().await
-}
-
-/// 预留会话操作：stop / restart / disconnect，可对接后续 UI
-#[tauri::command]
-async fn codeg_session_action(
-    action: String,
-    connection_id: String,
-    message: Option<String>,
-) -> Result<serde_json::Value, String> {
-    codeg::session_action(&action, &connection_id, message.as_deref()).await
 }
 
 #[derive(Serialize)]
@@ -294,8 +266,10 @@ async fn set_port(port: u16) -> Result<serde_json::Value, String> {
     if port == 0 {
         return Err("端口范围 1-65535".into());
     }
-    save_port(port)?;
+    // 先切端口，成功后再落盘：绑定失败时配置保持原样，下次启动仍用旧端口，
+    // 不会遗留一个「应用起得来但代理监听不了」的坏端口。
     proxy::restart_server(port).await?;
+    save_port(port)?;
     if let Some(handle) = proxy::app_handle() {
         let _ = handle.emit("server-info-changed", ());
     }
@@ -350,24 +324,43 @@ fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
 
 // ──────── Profile 管理 ────────
 
+/// 逐条解析渠道配置，返回 (成功解析的列表, 被丢弃的条数)。
+///
+/// 必须逐条容错：整数组反序列化（`from_value::<Vec<Profile>>`）只要有一个
+/// 条目不合法就整体失败，调用方再 `unwrap_or_default()` 会让渠道列表变成空。
+/// 后果不止是「少了一个渠道」——用户随后新建渠道时，
+/// `write_profiles_to_config` 会以这份空列表为基础写回，**其余渠道被永久删除**。
+fn parse_profiles_lenient(value: &serde_json::Value) -> (Vec<Profile>, usize) {
+    let Some(items) = value.get("profiles").and_then(|p| p.as_array()) else {
+        return (Vec::new(), 0);
+    };
+    let mut out = Vec::with_capacity(items.len());
+    let mut dropped = 0usize;
+    for item in items {
+        match serde_json::from_value::<Profile>(item.clone()) {
+            Ok(p) => out.push(p),
+            Err(_) => dropped += 1,
+        }
+    }
+    (out, dropped)
+}
+
 fn read_profiles_from_config() -> Vec<Profile> {
-    let Some(path) = config_path() else { return vec![] };
-    let Ok(text) = std::fs::read_to_string(&path) else { return vec![] };
-    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(json!({}));
-    v.get("profiles")
-        .and_then(|p| serde_json::from_value(p.clone()).ok())
-        .unwrap_or_default()
+    let (profiles, dropped) = parse_profiles_lenient(&read_config_value());
+    if dropped > 0 {
+        eprintln!(
+            "[config] 有 {dropped} 条渠道配置无法解析已忽略，其余 {} 条正常加载；\
+             原始文件未改动，修复后可重新读取",
+            profiles.len()
+        );
+    }
+    profiles
 }
 
 fn write_profiles_to_config(profiles: &[Profile]) -> Result<(), String> {
-    let path = config_path().ok_or("无法确定配置文件路径")?;
-    let mut v: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_else(|| json!({}));
-    v["profiles"] = serde_json::to_value(profiles).unwrap_or(json!([]));
-    std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap())
-        .map_err(|e| format!("写入配置失败：{e}"))
+    update_config_value(|v| {
+        v["profiles"] = serde_json::to_value(profiles).unwrap_or(json!([]));
+    })
 }
 
 /// 获取所有配置文件
@@ -419,14 +412,13 @@ fn parse_saved_config<T>(f: impl FnOnce(&serde_json::Value) -> T) -> T
 where
     T: Default,
 {
-    for candidate in config_candidates() {
-        if let Ok(text) = std::fs::read_to_string(&candidate) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                return f(&v);
-            }
-        }
+    // 只读「读写目标」这一个文件。曾经这里会顺序扫描候选、跳过不可解析的文件，
+    // 于是当首个候选损坏时会去读另一个文件——而写回仍落在首个候选上，
+    // 又构成「读 A 写 B」，A 里的配置在下次保存时被覆盖。
+    if config_path().is_none() {
+        return T::default();
     }
-    T::default()
+    f(&read_config_value())
 }
 
 /// 配置文件读写目标。
@@ -440,15 +432,52 @@ where
 ///   1. 找到第一个已存在的候选文件 → 读写都在这里
 ///   2. 都不存在 → 写到数据目录（macOS）或 exe 目录（其他平台）
 pub(crate) fn config_path() -> Option<std::path::PathBuf> {
-    let candidates = config_candidates();
-    candidates.into_iter().next().or_else(|| {
-        app_data_override().map(|d| d.join("token-monitor.json"))
-            .or_else(|| {
-                std::env::current_exe().ok().and_then(|e| {
-                    e.parent().map(|p| p.join("token-monitor.json"))
-                })
-            })
-    })
+    pick_config_path(&config_candidates(), |p| p.is_file())
+}
+
+/// 从候选中选出**唯一**的读写目标。
+///
+/// 规则（与 `config_path` 的文档一致）：第一个已存在的文件；
+/// 都不存在时取第一个候选，新配置将写在那里。
+///
+/// 抽成纯函数以便测试——真实路径依赖 exe / cwd / 环境变量，
+/// 无法在测试里构造「首个候选不存在、后续候选存在」的场景。
+fn pick_config_path(
+    candidates: &[std::path::PathBuf],
+    is_file: impl Fn(&std::path::Path) -> bool,
+) -> Option<std::path::PathBuf> {
+    candidates
+        .iter()
+        .find(|p| is_file(p))
+        .or_else(|| candidates.first())
+        .cloned()
+}
+
+/// 读取配置文件为 JSON。文件不存在、不可读或不是合法 JSON 时返回空对象。
+///
+/// 这是全进程唯一的配置**读**入口：读与写必须落在同一个文件上，否则会出现
+/// 「读 A 写 B」——保存时以 B 为基底覆盖写回，A 里的配置静默丢失。
+fn read_config_value() -> serde_json::Value {
+    config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+/// 以「读 → 改 → 写」方式更新配置文件（全进程唯一的写入口）。
+///
+/// 覆盖前把原文件滚动备份为 `.bak`。配置项分散在多个键
+/// （port / profiles / balance / probe…），任何一处解析异常导致的
+/// 覆盖都会连累其余键；一个备份是这类不可逆损失的最后一道防线。
+fn update_config_value(mutate: impl FnOnce(&mut serde_json::Value)) -> Result<(), String> {
+    let path = config_path().ok_or("无法确定配置文件路径")?;
+    let mut v = read_config_value();
+    mutate(&mut v);
+    let text = serde_json::to_string_pretty(&v).map_err(|e| format!("序列化配置失败：{e}"))?;
+    if path.is_file() {
+        let _ = std::fs::copy(&path, path.with_extension("json.bak"));
+    }
+    std::fs::write(&path, text).map_err(|e| format!("写入配置失败：{e}"))
 }
 
 /// 配置文件候选路径，读写顺序一致，避免读 A 写 B 的死锁。
@@ -593,13 +622,12 @@ fn main() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![]),
         ))
-        .setup(|app| {            // 初始化代理配置并启动后端服务（随程序自动运行）
-            // Codeg 配置独立加载；未配置时保持默认，不阻塞应用启动
-            let codeg_config_v: serde_json::Value = parse_saved_config(serde_json::Value::clone);
-            codeg::load_from_json(&codeg_config_v);
-            // 余额与探针配置同样独立加载，缺省即用默认值
-            balance::load_from_json(&codeg_config_v);
-            probe::load_from_json(&codeg_config_v);
+        .setup(|app| {
+            // 初始化代理配置并启动后端服务（随程序自动运行）
+            // 余额与探针配置独立加载，缺省即用默认值
+            let saved_config: serde_json::Value = parse_saved_config(serde_json::Value::clone);
+            balance::load_from_json(&saved_config);
+            probe::load_from_json(&saved_config);
 
             // 渠道列表是唯一配置来源；全局运行时只保留端口，
             // 上游地址 / 密钥 / 格式一律由调度选中的渠道提供
@@ -638,7 +666,12 @@ fn main() {
             // 立即启动代理服务（不等 DB 初始化）
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = proxy::restart_server(cfg.port).await {
-                    eprintln!("代理服务启动失败：{e}");
+                    // 除进程内状态（get_server_info 会读）外，再落盘一份：
+                    // 用户可能在下次启动前就把窗口关了，日志是唯一可追溯的记录。
+                    write_crash_log(&format!(
+                        "[main] 代理服务启动失败（端口 {}）：{}\n",
+                        cfg.port, e
+                    ));
                 }
             });
 
@@ -742,10 +775,6 @@ fn main() {
             get_stats,
             get_server_info,
             get_settings,
-            get_codeg_settings,
-            set_codeg_settings,
-            get_codeg_status,
-            codeg_session_action,
             set_port,
             get_close_action,
             set_close_action,
@@ -781,4 +810,142 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    /// 回归保护：`config_path` 的文档写明「找到第一个**已存在**的候选文件」，
+    /// 但实现曾是 `candidates.into_iter().next()`——无条件取第一个，`or_else`
+    /// 是死代码（候选列表在任何平台都非空）。
+    ///
+    /// 后果（macOS DMG / Linux AppImage）：数据目录已创建但配置文件仍在 exe 旁时，
+    /// 读会拿到不存在的路径 → 渠道列表为空；而写落在这个新路径上，
+    /// 于是「读 A 写 B」——保存一次就把旧配置整体覆盖，渠道全丢。
+    #[test]
+    fn config_path_prefers_first_existing_candidate() {
+        let candidates = vec![p("/data/token-monitor.json"), p("/app/token-monitor.json")];
+
+        // 首个不存在、第二个存在 → 必须选第二个（旧实现会选第一个）
+        let picked = pick_config_path(&candidates, |c| {
+            c == Path::new("/app/token-monitor.json")
+        });
+        assert_eq!(
+            picked,
+            Some(p("/app/token-monitor.json")),
+            "未跳过不存在的候选：会读到空配置，并把它写到另一个文件上"
+        );
+
+        // 两个都存在 → 数据目录优先（候选顺序即优先级）
+        let picked = pick_config_path(&candidates, |_| true);
+        assert_eq!(picked, Some(p("/data/token-monitor.json")));
+
+        // 都不存在 → 取第一个候选，新配置写在这里
+        let picked = pick_config_path(&candidates, |_| false);
+        assert_eq!(picked, Some(p("/data/token-monitor.json")));
+
+        // 无候选 → None
+        assert_eq!(pick_config_path(&[], |_| true), None);
+    }
+
+    fn profile_json(id: &str) -> serde_json::Value {
+        json!({
+            "id": id,
+            "name": id,
+            "upstream_url": "https://example.com/v1",
+            "api_key": "sk-x",
+            "model_override": "",
+            "max_concurrency": 10,
+            "upstream_format": "responses",
+        })
+    }
+
+    /// 回归保护：真实用户配置文件里的渠道**只有 6 个键**
+    /// （api_key / id / max_concurrency / model_override / name / upstream_url），
+    /// **没有 `upstream_format`**。而 `Profile::upstream_format` 是无默认值的必填字段，
+    /// 按 serde 语义整条解析失败——升级后 5 个渠道会全部消失。
+    ///
+    /// 旧配置文件必须能被继续读取：字段缺失应回落到合理默认值，
+    /// 而不是让用户的渠道凭空蒸发。
+    #[test]
+    fn profile_without_optional_fields_still_loads() {
+        // 与用户真实文件完全一致的形状（不含 upstream_format / enabled / rpm / tpm / weight）
+        let legacy = json!({
+            "id": "mtikt1571ffk",
+            "name": "小米大模型",
+            "upstream_url": "https://example.com/v1/responses",
+            "api_key": "sk-x",
+            "model_override": "mimo-v2.5",
+            "max_concurrency": 20,
+        });
+
+        let parsed: Profile = serde_json::from_value(legacy.clone())
+            .expect("缺少可选字段的旧配置应能解析，否则用户的渠道会全部消失");
+
+        assert_eq!(parsed.id, "mtikt1571ffk");
+        assert_eq!(parsed.max_concurrency, 20);
+        // 缺失字段回落到默认值
+        assert_eq!(
+            parsed.upstream_format, "responses",
+            "缺少 upstream_format 应回落到默认的 responses"
+        );
+        assert!(parsed.enabled, "缺少 enabled 应默认启用");
+        assert_eq!(parsed.weight, 100, "缺少 weight 应默认 100");
+        assert_eq!(parsed.max_rpm, 0, "缺少 max_rpm 表示不限制");
+        assert_eq!(parsed.max_tpm, 0, "缺少 max_tpm 表示不限制");
+
+        // 走完整的解析路径，确认不会被丢弃
+        let (profiles, dropped) = parse_profiles_lenient(&json!({ "profiles": [legacy] }));
+        assert_eq!(profiles.len(), 1, "旧格式渠道被丢弃了");
+        assert_eq!(dropped, 0, "旧格式渠道不应计入「损坏」");
+    }
+
+    /// 回归保护：整数组反序列化（`from_value::<Vec<Profile>>`）只要有一条不合法
+    /// 就整体失败，调用方再 `unwrap_or_default()` 会让渠道列表变成空。
+    /// 后果不止「少一个渠道」——用户随后新建渠道时，写回以这份空列表为基础，
+    /// **其余渠道被永久删除**。
+    ///
+    /// 注意：除 `id` 外所有字段都有默认值，因此「损坏」的样本必须是
+    /// 缺 `id` 或类型错误的条目，不能只是缺字段。
+    #[test]
+    fn one_broken_profile_does_not_wipe_the_rest() {
+        let value = json!({
+            "profiles": [
+                profile_json("ok-1"),
+                { "name": "没有 id 的坏条目" },              // 缺 id → 无法注册，必须丢弃
+                profile_json("ok-2"),
+            ]
+        });
+
+        let (profiles, dropped) = parse_profiles_lenient(&value);
+        assert_eq!(profiles.len(), 2, "一条损坏不应连累其余渠道");
+        assert_eq!(dropped, 1, "应如实报告被丢弃的条数");
+        assert_eq!(profiles[0].id, "ok-1");
+        assert_eq!(profiles[1].id, "ok-2");
+    }
+
+    /// profiles 键缺失或类型不对时按空列表处理，不应 panic
+    #[test]
+    fn missing_or_wrong_typed_profiles_yields_empty() {
+        assert!(parse_profiles_lenient(&json!({})).0.is_empty());
+        assert!(parse_profiles_lenient(&json!({"profiles": "nope"})).0.is_empty());
+        assert!(parse_profiles_lenient(&json!({"profiles": []})).0.is_empty());
+
+        // 全部损坏 → 空列表且全部计入丢弃（据此可在日志里如实告警）
+        // 缺 id、以及类型错误（max_concurrency 不是数字）两种损坏形态都要覆盖
+        let (profiles, dropped) = parse_profiles_lenient(&json!({
+            "profiles": [
+                { "name": "缺 id" },
+                { "id": "t", "max_concurrency": "not-a-number" },
+            ]
+        }));
+        assert!(profiles.is_empty());
+        assert_eq!(dropped, 2);
+    }
 }

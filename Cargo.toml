@@ -1,6 +1,6 @@
 [package]
 name = "token-monitor"
-version = "0.1.11"
+version = "0.1.12"
 description = "Trae API proxy with RPM/TPM monitoring"
 edition = "2021"
 rust-version = "1.77"
@@ -22,11 +22,6 @@ tokio-stream = "0.1"
 bytes = "1"
 chrono = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
-sysinfo = { version = "0.39", default-features = false, features = ["system", "disk"] }
-libloading = "0.7"
-
-[target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
