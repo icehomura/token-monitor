@@ -2083,13 +2083,129 @@ async fn convert_stream_anthropic_to_chat(
 
 // ---------- 上游请求（含重试）----------
 
+/// 渠道并发槽位守卫：drop 时自动归还渠道槽位并通知前端刷新。
+///
+/// 探针 / 余额用 RAII 而非手动 `release_slot`，避免中途 `return` 泄漏槽位。
+pub(crate) struct ChannelSlotGuard {
+    profile_id: Option<String>,
+}
+
+impl ChannelSlotGuard {
+    fn new(profile_id: String) -> Self {
+        Self { profile_id: Some(profile_id) }
+    }
+
+    /// 未占用渠道槽位（无调度器时的降级路径）
+    fn none() -> Self {
+        Self { profile_id: None }
+    }
+}
+
+impl Drop for ChannelSlotGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.profile_id.take() {
+            if let Some(s) = SCHEDULER.get() {
+                s.release_slot(&id);
+            }
+        }
+        if let Some(h) = APP_HANDLE.get() {
+            let _ = h.emit("stats-updated", ());
+        }
+    }
+}
+
+/// 全局闸门上限 = 已启用渠道并发之和。
+/// 取 `max(1)` 兜底：`try_acquire(0)` 会因 `cur >= 0` 恒真而永远拿不到槽位。
+fn global_gate_max(sched: &crate::scheduler::Scheduler) -> u64 {
+    sched.total_concurrency().max(1) as u64
+}
+
+/// 尝试同时占用「全局闸门 + 指定渠道」两个槽位。
+///
+/// 全局拿到但渠道已满时立即归还全局，不占着闸门让其它请求空等。
+/// 返回的全局守卫由调用方负责释放；渠道槽位见 `ChannelSlotGuard`。
+fn try_acquire_pair(
+    sched: &crate::scheduler::Scheduler,
+    profile_id: &str,
+    gate: u64,
+) -> Option<stats::SlotGuard> {
+    let id = stats::try_acquire(gate)?;
+    let global = stats::SlotGuard::new(id);
+    if sched.acquire_slot(profile_id) {
+        return Some(global);
+    }
+    drop(global); // 渠道已满，归还全局槽位继续等待
+    None
+}
+
+/// 探针 / 余额的并发租约：持有全局与渠道槽位，drop 时自动归还。
+///
+/// `profile_id` 为空的字符串表示未占用渠道槽位（无调度器时的降级路径）。
+pub(crate) struct Lease {
+    pub profile_id: String,
+    pub channel: ChannelConfig,
+    global: Option<stats::SlotGuard>,
+    channel_slot: ChannelSlotGuard,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // 字段声明顺序决定 drop 顺序：先还全局再还渠道，与获取顺序相反
+        drop(self.global.take());
+    }
+}
+
+/// 为探针 / 余额获取一次并发租约，目标 = 首个启用渠道。
+///
+/// 走与代理转发**同一条闸门**：先占全局，再占渠道槽位；渠道满则归还全局后重试。
+/// 最长等待 120 秒，超时或全禁用返回 Err（附可读原因）。
+pub(crate) async fn acquire_lease() -> Result<Lease, String> {
+    // 调度器未初始化（启动早期）：降级为全局闸门，目标取全局配置
+    let Some(sched) = SCHEDULER.get() else {
+        return match acquire_slot().await {
+            Some(g) => Ok(Lease {
+                profile_id: String::new(),
+                channel: probe_channel(),
+                global: Some(g),
+                channel_slot: ChannelSlotGuard::none(),
+            }),
+            None => Err("并发已满，等待超时".to_string()),
+        };
+    };
+
+    // 全部渠道禁用：继续等待也不会好转，直接给出可读原因
+    let target = sched
+        .first_enabled_id()
+        .ok_or_else(|| "所有渠道均已禁用".to_string())?;
+    let gate = global_gate_max(sched);
+
+    for _ in 0..600 {
+        if let Some(global) = try_acquire_pair(sched, &target, gate) {
+            // 凭据必须与所占槽位的渠道一致，避免两者取到不同渠道
+            let channel = channel_config(&target).unwrap_or_else(probe_channel);
+            return Ok(Lease {
+                profile_id: target.clone(),
+                channel,
+                global: Some(global),
+                channel_slot: ChannelSlotGuard::new(target),
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    Err("并发已满，等待槽位超时".to_string())
+}
+
 /// 软并发调度：最多等待 120 秒获取一个并发槽位；返回 None 表示等待超时。
-/// 供 HTTP 代理与探针 / 余额查询共用，保证所有打上游的请求都计入并发统计。
+///
+/// 仅在调度器缺席（启动早期）时使用；正常路径见 `acquire_lease` / `wait_for_slot`。
 pub(crate) async fn acquire_slot() -> Option<stats::SlotGuard> {
+    // 动态调度下全局配置不再承载并发上限（各渠道自有限制），
+    // 0 表示不设闸门——直接传给 try_acquire 会永远拿不到槽位。
     let max = cfg().max_concurrency;
+    let gate = if max == 0 { u64::MAX } else { max as u64 };
     let mut waited = false;
     for _ in 0..600 {
-        if let Some(id) = stats::try_acquire(max as u64) {
+        if let Some(id) = stats::try_acquire(gate) {
             if waited {
                 println!("[proxy] 并发达到上限，已等待排空；当前并发 {}", stats::active());
             }
@@ -2133,24 +2249,20 @@ async fn wait_for_slot() -> Result<(stats::SlotGuard, String), Response> {
     };
 
     // 全局闸门取「已启用渠道并发之和」，否则大并发渠道会被小渠道上限卡住
-    let max = sched.total_concurrency().max(1);
+    let gate = global_gate_max(sched);
     let mut waited = false;
 
     for _ in 0..600 {
         // 每轮重新选路，渠道释放后能重新被选中，而不是锁定首次选择
         if let Some(profile_id) = sched.select_channel() {
-            if let Some(id) = stats::try_acquire(max as u64) {
+            if let Some(global) = try_acquire_pair(sched, &profile_id, gate) {
                 if waited {
                     println!("[proxy] 并发达到上限，已等待排空；当前并发 {}", stats::active());
                 }
                 if let Some(h) = APP_HANDLE.get() {
                     let _ = h.emit("stats-updated", ());
                 }
-                if sched.acquire_slot(&profile_id) {
-                    return Ok((stats::SlotGuard::new(id), profile_id));
-                }
-                // 渠道已满，释放全局槽位后继续等待（drop 触发 ACTIVE -1）
-                drop(stats::SlotGuard::new(id));
+                return Ok((global, profile_id));
             }
         } else if !sched.has_enabled_channel() {
             // 无任何启用渠道：继续等待也不会好转，立即返回明确错误
@@ -2880,15 +2992,58 @@ fn build_router() -> Router<()> {
         .with_state(())
 }
 
+/// 进程级单例（CONFIG / SCHEDULER / 渠道凭据表）在测试间共享，
+/// 并行执行会互相污染（例如一个用例的渠道被另一个用例的 `first_enabled_id` 看见）。
+/// 所有触碰这些单例的测试统一用这把锁串行化。
+#[cfg(test)]
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod channel_routing_tests {
     use super::*;
+
+    /// 见 `TEST_LOCK` 的说明：串行化对进程级单例的访问
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        test_lock()
+    }
+
+    fn test_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn mk_config(api_key: &str, upstream_url: &str) -> ChannelConfig {
+        ChannelConfig {
+            api_key: api_key.into(),
+            upstream_url: upstream_url.into(),
+            upstream_format: UpstreamFormat::Responses,
+            model_override: String::new(),
+        }
+    }
+
+    /// 渠道当前在飞并发数（与并发上限无关，适合做稳定的断言）
+    fn in_flight(sched: &crate::scheduler::Scheduler, profile_id: &str) -> usize {
+        sched
+            .snapshot()
+            .iter()
+            .find(|c| c.profile_id == profile_id)
+            .map(|c| c.current_concurrency)
+            .unwrap_or(0)
+    }
 
     /// 回归保护：修复前请求路径读的是一个「空调度器」实例，
     /// `select_channel()` 恒为 None，于是所有请求一律 429。
     /// 这里验证注册渠道后调度器确实能选出渠道，且能解析出对应上游凭据。
     #[test]
     fn registered_channel_is_selectable_and_resolvable() {
+        let _g = lock();
         let sched = init_scheduler();
 
         // ch1 禁用、ch2 启用
@@ -2919,6 +3074,11 @@ mod channel_routing_tests {
         // 这里只断言 channel_config 的查找结果，不走 resolve_channel 的
         // 「回退全局配置」分支——那条分支读进程级 CONFIG，会与其它测试相互干扰。
         assert!(channel_config("no-such-channel").is_none());
+
+        sched.remove_channel("ch1");
+        sched.remove_channel("ch2");
+        remove_channel_config("ch1");
+        remove_channel_config("ch2");
     }
 
     /// 回归保护：「全禁用」必须与「全满」区分开。
@@ -2941,17 +3101,92 @@ mod channel_routing_tests {
         assert_eq!(s.select_channel().as_deref(), Some("b"));
     }
 
+    /// 回归保护：修复前探针 / 余额走的是 `acquire_slot()` 这条遗留全局路径，
+    /// 且全局 `max_concurrency` 被置为 0，导致 `try_acquire(0)` 恒返回 None
+    /// —— 探针每次都要空等 120 秒后才报「并发已满」。
+    #[test]
+    fn zero_global_max_must_not_deadlock_slot_acquisition() {
+        let _g = lock();
+        // 直接暴露底层行为：max=0 时 cur >= 0 恒真，永远拿不到槽位
+        assert!(
+            stats::try_acquire(0).is_none(),
+            "try_acquire(0) 竟然成功了，前提假设有变"
+        );
+
+        // acquire_slot 必须把 0 当作「不设闸门」，而不是「零容量」
+        *CONFIG.write().unwrap_or_else(|e| e.into_inner()) = Some(ProxyConfig {
+            api_key: String::new(),
+            model_override: String::new(),
+            port: 0,
+            upstream_url: String::new(),
+            max_concurrency: 0,
+            upstream_format: UpstreamFormat::Responses,
+        });
+        let got = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(acquire_slot());
+        assert!(
+            got.is_some(),
+            "全局 max_concurrency=0 时 acquire_slot 拿不到槽位，探针会永远失败"
+        );
+    }
+
+    /// 回归保护：租约必须经调度闸门获取，并占用选中渠道的槽位。
+    /// 修复前探针不选渠道、不占渠道槽位，完全绕开渠道的并发 / RPM / TPM 限制。
+    #[test]
+    fn probe_lease_occupies_channel_slot() {
+        let _g = lock();
+        let sched = init_scheduler();
+        sched.upsert_channel("probe-ch", true, 8, 0, 0, 100);
+        set_channel_config("probe-ch", mk_config("sk-probe", "https://probe.example.com/v1/responses"));
+
+        let rt = test_rt();
+        let lease = rt.block_on(acquire_lease()).expect("应能取到租约");
+        let leased_id = lease.profile_id.clone();
+
+        // 断言与并发上限无关：直接看该渠道的在飞计数是否 +1
+        assert_eq!(
+            in_flight(sched, &leased_id),
+            1,
+            "租约没有占用渠道并发槽位，探针绕过了渠道限制"
+        );
+        assert_eq!(lease.channel.api_key, "sk-probe", "租约凭据与所持槽位渠道不一致");
+
+        drop(lease);
+        assert_eq!(
+            in_flight(sched, &leased_id),
+            0,
+            "租约释放后渠道槽位未归还，渠道会被探针占死"
+        );
+
+        sched.remove_channel("probe-ch");
+        remove_channel_config("probe-ch");
+    }
+
+    /// 全部渠道禁用时，探针应立刻拿到可读原因，而不是空等 120 秒
+    #[test]
+    fn probe_lease_reports_disabled_channels_immediately() {
+        let _g = lock();
+        let sched = init_scheduler();
+        sched.upsert_channel("probe-off", false, 10, 0, 0, 100);
+
+        let err = test_rt()
+            .block_on(acquire_lease())
+            .err()
+            .expect("全禁用时不应拿到租约");
+        assert!(err.contains("禁用"), "错误信息应说明渠道被禁用，实际：{err}");
+
+        sched.remove_channel("probe-off");
+    }
+
     /// 渠道凭据按 profile_id 隔离，互不串用
     #[test]
     fn channel_configs_are_isolated_per_profile() {
-        let mk = |key: &str, url: &str| ChannelConfig {
-            api_key: key.into(),
-            upstream_url: url.into(),
-            upstream_format: UpstreamFormat::Responses,
-            model_override: String::new(),
-        };
-        set_channel_config("iso-a", mk("sk-a", "https://a.example.com"));
-        set_channel_config("iso-b", mk("sk-b", "https://b.example.com"));
+        let _g = lock();
+        set_channel_config("iso-a", mk_config("sk-a", "https://a.example.com"));
+        set_channel_config("iso-b", mk_config("sk-b", "https://b.example.com"));
 
         assert_eq!(resolve_channel("iso-a").api_key, "sk-a");
         assert_eq!(resolve_channel("iso-b").upstream_url, "https://b.example.com");
@@ -2960,6 +3195,8 @@ mod channel_routing_tests {
         remove_channel_config("iso-a");
         assert!(channel_config("iso-a").is_none());
         assert_eq!(channel_config("iso-b").map(|c| c.api_key), Some("sk-b".into()));
+
+        remove_channel_config("iso-b");
     }
 }
 
@@ -2972,6 +3209,7 @@ mod body_limit_tests {
     /// build_router 必须放宽该上限，这里用 3MB 请求体验证不再被拦截。
     #[tokio::test]
     async fn accepts_body_larger_than_axum_default_two_mb() {
+        let _g = test_lock();
         // 上游地址留空 → handler 立即返回配置错误，不会发起真实网络请求
         *CONFIG.write().unwrap_or_else(|e| e.into_inner()) = Some(ProxyConfig {
             api_key: "test".into(),

@@ -116,7 +116,8 @@ function onDatePickerConfirm(rangeObj) {
 async function initInfo() {
   try {
     const info = await invoke('get_server_info')
-    endpointText.value = info.endpoint + '/*' + (info.model_override ? `（强制模型 ${info.model_override}）` : '')
+    // 不再显示强制模型：动态调度下各渠道模型不同，展示单个模型名会误导
+    endpointText.value = info.endpoint + '/*'
     if (Array.isArray(info.endpoints)) {
       endpointTitle.value = '支持的接口：' + info.endpoints.join('  ·  ')
     }

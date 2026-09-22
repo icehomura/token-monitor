@@ -284,18 +284,27 @@ async function probe() {
   recomputeStats()
 }
 
+// 单次探测可能因为渠道排队而耗时（最长 120 秒），而 setInterval 不会等待
+// 异步回调，慢探测会不断堆积。用重入标记跳过上一轮未结束时的本轮。
+let inFlight = false
+
 // 每次 tick 重读设置：间隔变了重建定时器，被关闭则停表并隐藏整行
 async function tick() {
-  if (stopped) return
-  const s = await readProbeSettings()
-  if (!s || s.enabled === false) {
-    stopTimer()
-    visible.value = false
-    return
+  if (stopped || inFlight) return
+  inFlight = true
+  try {
+    const s = await readProbeSettings()
+    if (!s || s.enabled === false) {
+      stopTimer()
+      visible.value = false
+      return
+    }
+    visible.value = true
+    reschedule(s.interval_secs)
+    await probe()
+  } finally {
+    inFlight = false
   }
-  visible.value = true
-  reschedule(s.interval_secs)
-  await probe()
 }
 
 // 探测条宽度由剩余空间动态决定，窗口变宽时多显示几个旧色块（数据不丢失），

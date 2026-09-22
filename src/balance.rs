@@ -255,17 +255,18 @@ pub async fn get_balance() -> Result<serde_json::Value, String> {
             "reason": "当前上游非 DeepSeek 官方，余额查询不可用",
         }));
     }
-    let api_key = crate::proxy::default_api_key().trim().to_string();
+    // 计入并发：走与代理转发同一条闸门（全局 + 首个启用渠道），
+    // 避免余额轮询把槽位挤爆，也不会绕过渠道并发限制。
+    // lease 在此作用域结束时自动 Drop 释放，无需手动 release。
+    let lease = match crate::proxy::acquire_lease().await {
+        Ok(l) => l,
+        Err(e) => return Err(e),
+    };
+    // 用租约选中渠道的 Key，保证与所占槽位的渠道一致
+    let api_key = lease.channel.api_key.trim().to_string();
     if api_key.is_empty() {
         return Err("API Key 未配置，无法查询余额".into());
     }
-
-    // 计入并发：与代理请求共享同一并发上限，避免余额轮询把槽位挤爆。
-    // guard 在此作用域结束时自动 Drop 释放，无需手动 release。
-    let _guard = match crate::proxy::acquire_slot().await {
-        Some(g) => g,
-        None => return Err("并发已满，等待超时".into()),
-    };
 
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)

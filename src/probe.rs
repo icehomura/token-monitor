@@ -231,25 +231,30 @@ pub fn set_probe_settings(config: Value) -> Result<Value, String> {
 /// 这类不可恢复场景才返回 Err；正常路径不 panic。
 #[tauri::command]
 pub async fn test_ai_connection() -> Result<Value, String> {
-    // 探针目标 = 首个启用渠道（无启用渠道时回退全局配置）
-    let ch = crate::proxy::probe_channel();
-    let upstream = ch.upstream_url.trim().to_string();
+    // 未开启的探针不占用任何并发槽位，直接回结果
+    let enabled = config().enabled;
+    if !enabled {
+        return Ok(failure("探针未开启"));
+    }
 
-    if let Some(v) = precheck(config().enabled, &upstream, &ch.api_key) {
+    // 计入并发：走与代理转发同一条闸门（全局 + 首个启用渠道），
+    // 不会绕过渠道的并发 / RPM / TPM 限制偷偷打上游。
+    // 目标渠道以租约为唯一来源，避免与凭据解析取到不同渠道。
+    let lease = match crate::proxy::acquire_lease().await {
+        Ok(l) => l,
+        Err(e) => return Ok(failure(e)),
+    };
+    let upstream = lease.channel.upstream_url.trim().to_string();
+
+    if let Some(v) = precheck(enabled, &upstream, &lease.channel.api_key) {
         return Ok(v);
     }
 
-    // 计入并发：与代理转发共用同一套槽位，等待超时直接给出可读提示
-    let _slot = match crate::proxy::acquire_slot().await {
-        Some(g) => g,
-        None => return Ok(failure("并发已满，等待槽位超时")),
-    };
-
     let start = Instant::now();
-    let result = match ch.upstream_format {
-        crate::proxy::UpstreamFormat::ChatCompletions => probe_chat_completions(&upstream, &ch.api_key, &ch.model_override).await,
-        crate::proxy::UpstreamFormat::Anthropic => probe_anthropic(&upstream, &ch.api_key, &ch.model_override).await,
-        crate::proxy::UpstreamFormat::Responses => probe_responses(&upstream, &ch.api_key, &ch.model_override).await,
+    let result = match lease.channel.upstream_format {
+        crate::proxy::UpstreamFormat::ChatCompletions => probe_chat_completions(&upstream, &lease.channel.api_key, &lease.channel.model_override).await,
+        crate::proxy::UpstreamFormat::Anthropic => probe_anthropic(&upstream, &lease.channel.api_key, &lease.channel.model_override).await,
+        crate::proxy::UpstreamFormat::Responses => probe_responses(&upstream, &lease.channel.api_key, &lease.channel.model_override).await,
     };
     let latency_ms = start.elapsed().as_millis() as u64;
 
