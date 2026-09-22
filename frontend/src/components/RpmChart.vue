@@ -107,8 +107,8 @@ function renderChart() {
         {
           // 1：输入词元，右侧靠内
           type: 'value', name: '输入词元', position: 'right', offset: 0,
-          nameGap: 10,
-          nameTextStyle: { color: tc.label, align: 'right' },
+          nameGap: 6,
+          nameTextStyle: { color: tc.label, align: 'left' },
           ...axis(),
           axisLabel: { ...axis().axisLabel, formatter: v => fmtTokens(v, props.convertUnits) },
           splitLine: { show: false },
@@ -116,8 +116,8 @@ function renderChart() {
         {
           // 2：输出词元，右侧再向外偏移一条轴位
           type: 'value', name: '输出词元', position: 'right', offset: 72,
-          nameGap: 10,
-          nameTextStyle: { color: tc.label, align: 'right' },
+          nameGap: 6,
+          nameTextStyle: { color: tc.label, align: 'left' },
           ...axis(),
           axisLabel: { ...axis().axisLabel, formatter: v => fmtTokens(v, props.convertUnits) },
           splitLine: { show: false },

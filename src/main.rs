@@ -399,7 +399,17 @@ fn delete_profile(id: String) -> Result<serde_json::Value, String> {
 #[tauri::command]
 fn get_scheduler_status() -> serde_json::Value {
     match proxy::scheduler() {
-        Some(scheduler) => serde_json::json!({ "channels": scheduler.snapshot() }),
+        Some(scheduler) => {
+            let mut channels = scheduler.snapshot();
+            // 把渠道名称挂到快照上：调度器只有 profile_id，名字在 profile 配置里
+            let profiles = read_profiles_from_config();
+            for ch in &mut channels {
+                if let Some(p) = profiles.iter().find(|p| p.id == ch.profile_id) {
+                    ch.name = p.name.clone();
+                }
+            }
+            serde_json::json!({ "channels": channels })
+        }
         None => serde_json::json!({ "channels": [] }),
     }
 }

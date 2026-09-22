@@ -491,6 +491,7 @@ impl Scheduler {
             .iter()
             .map(|ch| ChannelSnapshot {
                 profile_id: ch.profile_id.clone(),
+                name: String::new(), // 由调用方（get_scheduler_status）从 profile 配置填充
                 enabled: ch.is_enabled(),
                 current_concurrency: ch.current_concurrency.load(Ordering::Relaxed),
                 max_concurrency: ch.max_concurrency(),
@@ -510,6 +511,8 @@ impl Scheduler {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChannelSnapshot {
     pub profile_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name: String,
     pub enabled: bool,
     pub current_concurrency: usize,
     /// 用户配置的并发天花板
