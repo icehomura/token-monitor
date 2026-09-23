@@ -3,7 +3,10 @@
     <div class="scheduler-grid">
       <div v-for="ch in channels" :key="ch.profile_id" class="channel-item" :class="{ disabled: !ch.enabled }">
         <div class="channel-header">
-          <span class="channel-name">{{ ch.name || ch.profile_id }}</span>
+          <span class="channel-name">
+            {{ ch.name || ch.profile_id }}
+            <span v-if="channelBalances[ch.profile_id]?.text" class="channel-balance" :class="{ ok: channelBalances[ch.profile_id].ok }">{{ channelBalances[ch.profile_id].text }}</span>
+          </span>
           <span v-if="!ch.enabled" class="channel-disabled">已禁用</span>
         </div>
         <div class="channel-stats">
@@ -44,13 +47,33 @@ import SettingsCard from './SettingsCard.vue'
 
 const { invoke } = useTauri()
 const channels = ref([])
+const channelBalances = ref({})
 let refreshTimer = null
+let balanceTimer = null
 
 async function refresh() {
   try {
     const status = await invoke('get_scheduler_status')
     channels.value = status.channels || []
   } catch {}
+}
+
+async function refreshBalances() {
+  const result = {}
+  for (const ch of channels.value) {
+    try {
+      const b = await invoke('get_channel_balance', { profileId: ch.profile_id }) || {}
+      if (b.supported === false || b.available !== true) {
+        result[ch.profile_id] = { text: '', ok: false }
+      } else {
+        const sym = b.currency === 'USD' ? '$' : '¥'
+        result[ch.profile_id] = { text: `${sym}${b.total || '--'}`, ok: true }
+      }
+    } catch {
+      result[ch.profile_id] = { text: '', ok: false }
+    }
+  }
+  channelBalances.value = result
 }
 
 function formatToken(n) {
@@ -64,13 +87,16 @@ function isThrottled(ch) {
   return typeof ch.effective_limit === 'number' && ch.effective_limit < ch.max_concurrency
 }
 
-onMounted(() => {
-  refresh()
+onMounted(async () => {
+  await refresh()
+  await refreshBalances()
   refreshTimer = setInterval(refresh, 2000)
+  balanceTimer = setInterval(refreshBalances, 30000)
 })
 
 onUnmounted(() => {
   if (refreshTimer) clearInterval(refreshTimer)
+  if (balanceTimer) clearInterval(balanceTimer)
 })
 </script>
 
@@ -103,6 +129,23 @@ onUnmounted(() => {
   font-size: 13px;
   font-weight: 600;
   color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.channel-balance {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+  background: var(--border);
+  padding: 1px 7px;
+  border-radius: 10px;
+  line-height: 1.5;
+}
+
+.channel-balance.ok {
+  color: var(--green);
 }
 
 .channel-disabled {

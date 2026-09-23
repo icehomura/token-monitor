@@ -256,7 +256,7 @@ onBeforeUnmount(() => {
 .balance-badge {
   align-self: center;
   margin-right: 10px;
-  max-width: 180px;
+  max-width: 360px;
   overflow: hidden;
   text-overflow: ellipsis;
   font-size: 11px; color: var(--muted); background: var(--border);
