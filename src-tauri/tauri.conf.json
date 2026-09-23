@@ -5,8 +5,8 @@
   "identifier": "com.icehomura.token-monitor",
   "build": {
     "frontendDist": "../dist",
-    "beforeDevCommand": "bun run dev",
-    "beforeBuildCommand": "bun run build"
+    "beforeDevCommand": "",
+    "beforeBuildCommand": ""
   },
   "app": {
     "withGlobalTauri": true,
