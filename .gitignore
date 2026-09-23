@@ -11,17 +11,17 @@ token-monitor-data.json.bak
 
 # Rust build artifacts
 target/
+src-tauri/target/
 
 # Frontend dependencies and build output
-frontend/node_modules/
-frontend/dist/
+node_modules/
+dist/
 
 # Tauri generated files
-gen/
+src-tauri/gen/
 
 # OMC state files
 .omc/
-frontend/.omc/
 
 # OS files
 .DS_Store

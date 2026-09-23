@@ -44,7 +44,10 @@
               class="profile-item"
             >
               <div class="profile-info">
-                <span class="profile-name">{{ p.name }}</span>
+                <span class="profile-name">
+                  {{ p.name }}
+                  <span v-if="channelBalances[p.id]?.text" class="channel-balance" :class="{ ok: channelBalances[p.id].ok }">{{ channelBalances[p.id].text }}</span>
+                </span>
                 <span class="profile-detail">{{ p.upstream_url || '默认地址' }} · {{ formatLabel(p.upstream_format) }} · {{ p.model_override || '原始模型' }} · 并发{{ p.max_concurrency }}{{ p.max_rpm > 0 ? ` · RPM ${p.max_rpm}` : '' }}{{ p.max_tpm > 0 ? ` · TPM ${p.max_tpm}` : '' }}{{ p.weight !== 100 ? ` · 权重${p.weight}` : '' }}</span>
               </div>
               <div class="profile-actions">
@@ -80,12 +83,6 @@
             <span class="settings-label">探测间隔（秒）</span>
             <BaseInput v-model.number="probeInterval" type="number" spinner :min="1" :max="1800" />
           </div>
-          <div class="settings-actions">
-            <BaseButton variant="primary" @click="saveProbe">保存探针设置</BaseButton>
-          </div>
-          <template #hint>
-            <small :class="['ff-hint', probeMsgType]">{{ probeMsg }}</small>
-          </template>
         </SettingsCard>
         </div><!-- /Tab 探针 -->
 
@@ -109,12 +106,6 @@
             <span class="settings-label">当前余额</span>
             <span :class="['ff-hint', balanceInfoType]">{{ balanceInfo }}</span>
           </div>
-          <div class="settings-actions">
-            <BaseButton variant="primary" @click="saveBalance">保存余额设置</BaseButton>
-          </div>
-          <template #hint>
-            <small :class="['ff-hint', balanceMsgType]">{{ balanceMsg }}</small>
-          </template>
         </SettingsCard>
 
         </div><!-- /Tab 余额 -->
@@ -285,6 +276,7 @@ const profiles = ref([])
 const editingProfile = ref(null)
 const profileMsg = ref('')
 const profileMsgType = ref('')
+const channelBalances = ref({}) // profile_id -> { text, ok }
 
 // 动态调度下不再有「激活配置」，上限取所有启用渠道并发上限之和。
 // 无启用渠道时不能回落成数字，否则会显示一个并不存在的上限。
@@ -311,15 +303,11 @@ const autostartMsgType = ref('')
 // ──────── 探针设置状态 ────────
 const probeEnabled = ref(false)
 const probeInterval = ref(15)
-const probeMsg = ref('')
-const probeMsgType = ref('')
 
 // ──────── 余额设置状态 ────────
 const balanceEnabled = ref(false)
 const balanceCurrency = ref('CNY')
 const balanceInterval = ref(15)
-const balanceMsg = ref('')
-const balanceMsgType = ref('')
 const balanceInfo = ref('—')       // 只读的当前余额展示
 const balanceInfoType = ref('')    // '' 为灰色提示，'ok' 为绿色
 
@@ -380,6 +368,8 @@ watch(() => props.visible, async (v) => {
   } catch {}
   // 加载当前余额（只读展示）
   await refreshBalance()
+  // 加载各渠道余额
+  await refreshChannelBalances()
   _loadingSettings.value = false
 })
 
@@ -412,13 +402,6 @@ watch(autostart, async (v) => {
   } catch (e) {
     autostartMsg.value = String(e); autostartMsgType.value = 'err'
   }
-})
-
-// 余额开关变化时同步一次只读状态行（保存仍由按钮触发）
-watch(balanceEnabled, async (v) => {
-  if (_loadingSettings.value) return
-  if (!v) { balanceInfo.value = '—'; balanceInfoType.value = ''; return }
-  await refreshBalance()
 })
 
 // ──────── Profile 操作 ────────
@@ -474,48 +457,39 @@ function onProfileSave(profile) {
   })
 }
 
-// ──────── 探针 ────────
-async function saveProbe() {
-  probeMsg.value = '保存中…'; probeMsgType.value = ''
-  const cfg = {
-    enabled: probeEnabled.value,
-    interval_secs: clampInterval(probeInterval.value),
-  }
+// ──────── 探针（自动保存） ────────
+async function saveProbeSettings() {
   try {
-    const r = await invoke('set_probe_settings', { config: cfg }) || {}
-    // 用后端返回的配置回填
-    const saved = r.config || r
-    probeEnabled.value = !!saved.enabled
-    probeInterval.value = clampInterval(saved.interval_secs)
-    probeMsg.value = `✓ 已保存${probeEnabled.value ? '，探针已开启' : '，探针已关闭'}`
-    probeMsgType.value = 'ok'
-  } catch (e) {
-    probeMsg.value = String(e); probeMsgType.value = 'err'
-  }
+    await invoke('set_probe_settings', {
+      config: { enabled: probeEnabled.value, interval_secs: clampInterval(probeInterval.value) }
+    })
+  } catch {}
 }
 
-// ──────── 余额 ────────
-async function saveBalance() {
-  balanceMsg.value = '保存中…'; balanceMsgType.value = ''
-  const cfg = {
-    enabled: balanceEnabled.value,
-    currency: balanceCurrency.value,
-    interval_secs: clampInterval(balanceInterval.value),
-  }
+watch(probeEnabled, () => { if (!_loadingSettings.value) saveProbeSettings() })
+watch(probeInterval, () => { if (!_loadingSettings.value) saveProbeSettings() })
+
+// ──────── 余额（自动保存） ────────
+async function saveBalanceSettings() {
   try {
-    const r = await invoke('set_balance_settings', { config: cfg }) || {}
-    // 用后端返回的配置回填
-    const saved = r.config || r
-    balanceEnabled.value = !!saved.enabled
-    balanceCurrency.value = saved.currency || 'CNY'
-    balanceInterval.value = clampInterval(saved.interval_secs)
-    balanceMsg.value = `✓ 已保存${balanceEnabled.value ? '，余额查询已开启' : '，余额查询已关闭'}`
-    balanceMsgType.value = 'ok'
-    await refreshBalance()
-  } catch (e) {
-    balanceMsg.value = String(e); balanceMsgType.value = 'err'
-  }
+    await invoke('set_balance_settings', {
+      config: {
+        enabled: balanceEnabled.value,
+        currency: balanceCurrency.value,
+        interval_secs: clampInterval(balanceInterval.value),
+      }
+    })
+  } catch {}
 }
+
+watch(balanceEnabled, async (v) => {
+  if (_loadingSettings.value) return
+  if (!v) { balanceInfo.value = '—'; balanceInfoType.value = ''; return }
+  await saveBalanceSettings()
+  await refreshBalance()
+})
+watch(balanceCurrency, () => { if (!_loadingSettings.value) saveBalanceSettings() })
+watch(balanceInterval, () => { if (!_loadingSettings.value) saveBalanceSettings() })
 
 // 读取当前余额，填充只读状态行（不可用属于正常状态，用灰色而非红色）
 async function refreshBalance() {
@@ -536,6 +510,25 @@ async function refreshBalance() {
     balanceInfo.value = String(e)
     balanceInfoType.value = ''
   }
+}
+
+// 逐渠道查询余额（仅对 DeepSeek 官方渠道有效）
+async function refreshChannelBalances() {
+  const result = {}
+  for (const p of profiles.value) {
+    try {
+      const b = await invoke('get_channel_balance', { profileId: p.id }) || {}
+      if (b.supported === false || b.available !== true) {
+        result[p.id] = { text: '', ok: false }
+      } else {
+        const sym = (b.currency || balanceCurrency.value) === 'USD' ? '$' : '¥'
+        result[p.id] = { text: `${sym}${b.total || '--'}`, ok: true }
+      }
+    } catch {
+      result[p.id] = { text: '', ok: false }
+    }
+  }
+  channelBalances.value = result
 }
 
 // ──────── 端口 ────────
@@ -665,7 +658,12 @@ async function savePort() {
 }
 .profile-item:hover { border-color: var(--muted); }
 .profile-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.profile-name { font-size: 13px; font-weight: 600; color: var(--text); }
+.profile-name { font-size: 13px; font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 8px; }
+.channel-balance {
+  font-size: 11px; font-weight: 500; color: var(--muted);
+  background: var(--border); padding: 1px 7px; border-radius: 10px; line-height: 1.5;
+}
+.channel-balance.ok { color: var(--green); }
 .profile-detail { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .profile-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 .profile-edit-btn, .profile-del-btn {

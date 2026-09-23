@@ -92,7 +92,7 @@ function renderChart() {
         textStyle: { color: tc.label, fontSize: 12 },
       },
       // 右侧两条轴需要额外留白，故 right 比 left 大
-      grid: { left: 56, right: 150, top: 36, bottom: 38 },
+      grid: { left: 56, right: 150, top: 48, bottom: 48 },
       xAxis: { type: 'category', data: props.labels, ...axis(), boundaryGap: true },
       yAxis: [
         {
@@ -107,7 +107,7 @@ function renderChart() {
         {
           // 1：输入词元，右侧靠内
           type: 'value', name: '输入词元', position: 'right', offset: 0,
-          nameGap: 6,
+          nameGap: 18,
           nameTextStyle: { color: tc.label, align: 'left' },
           ...axis(),
           axisLabel: { ...axis().axisLabel, formatter: v => fmtTokens(v, props.convertUnits) },
@@ -116,7 +116,7 @@ function renderChart() {
         {
           // 2：输出词元，右侧再向外偏移一条轴位
           type: 'value', name: '输出词元', position: 'right', offset: 72,
-          nameGap: 6,
+          nameGap: 18,
           nameTextStyle: { color: tc.label, align: 'left' },
           ...axis(),
           axisLabel: { ...axis().axisLabel, formatter: v => fmtTokens(v, props.convertUnits) },

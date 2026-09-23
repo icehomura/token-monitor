@@ -58,7 +58,7 @@ import IconButton from './base/IconButton.vue'
 defineProps({ concurrency: { type: Number, default: 0 } })
 defineEmits(['open-settings'])
 
-const { invoke, getCurrentWindow } = useTauri()
+const { invoke, getCurrentWindow, listen } = useTauri()
 const win = getCurrentWindow()
 const pinned = ref(false)
 const isMaximized = ref(false)
@@ -72,6 +72,8 @@ const balance = ref(null)
 let balanceTimer = null
 let balanceIntervalMs = 0 // 当前定时器对应的间隔（毫秒），为 0 表示未启动
 let balanceStopped = false // 组件已卸载标记，避免卸载后继续轮询
+let lastBalanceQueryTime = 0 // 上次余额查询时间戳，用于节流
+const BALANCE_THROTTLE_MS = 30000 // 最小查询间隔 30 秒
 
 // 三种展示状态：不支持（灰，非错误）/ 可用（绿色，币种符号 + 余额）/ 不可用（灰，原因）
 const balanceOk = computed(() => {
@@ -125,10 +127,26 @@ function stopBalanceTimer() {
 async function fetchBalance() {
   try {
     const r = await invoke('get_balance')
-    if (r) balance.value = r
+    if (r) {
+      balance.value = r
+      lastBalanceQueryTime = Date.now()
+    }
   } catch (e) {
     balance.value = { supported: true, available: false, reason: String(e) }
   }
+}
+
+// 节流版余额查询：被后端 balance-query-triggered 事件触发，30 秒内不重复查询
+let unlistenBalance = null
+async function throttledFetchBalance() {
+  if (balanceStopped) return
+  const now = Date.now()
+  if (now - lastBalanceQueryTime < BALANCE_THROTTLE_MS) return
+  // 确保余额功能已开启
+  const s = await readBalanceSettings()
+  if (!s || s.enabled === false) return
+  balanceVisible.value = true
+  await fetchBalance()
 }
 
 // 每次 tick 重读设置：间隔变了重建定时器，被关闭则停表并隐藏
@@ -190,16 +208,19 @@ onMounted(async () => {
   const s = await readBalanceSettings()
   if (!s || s.enabled === false) {
     balanceVisible.value = false
-    return
+  } else {
+    balanceVisible.value = true
+    rescheduleBalance(s.interval_secs)
+    await fetchBalance() // 首屏立即取一次，避免空白
   }
-  balanceVisible.value = true
-  rescheduleBalance(s.interval_secs)
-  await fetchBalance() // 首屏立即取一次，避免空白
+  // 监听后端请求完成后的余额查询触发事件
+  unlistenBalance = await listen('balance-query-triggered', throttledFetchBalance)
 })
 
 onBeforeUnmount(() => {
   balanceStopped = true
   stopBalanceTimer()
+  unlistenBalance?.()
 })
 </script>
 

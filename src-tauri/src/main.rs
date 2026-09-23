@@ -797,6 +797,7 @@ fn main() {
             balance::get_balance_settings,
             balance::set_balance_settings,
             balance::get_balance,
+            balance::get_channel_balance,
             probe::get_probe_settings,
             probe::set_probe_settings,
             probe::test_ai_connection,

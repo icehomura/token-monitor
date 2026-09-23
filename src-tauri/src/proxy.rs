@@ -2922,6 +2922,16 @@ fn note_upstream_feedback(profile_id: &str, status: StatusCode) {
     }
 }
 
+/// 若渠道上游为 DeepSeek 官方，向前端发射余额查询触发事件。
+/// 用于每次请求完成后按渠道动态查询余额。
+fn emit_balance_query_if_deepseek(profile_id: &str, upstream_url: &str) {
+    if crate::balance::is_official_upstream(upstream_url) {
+        if let Some(h) = APP_HANDLE.get() {
+            let _ = h.emit("balance-query-triggered", serde_json::json!({ "profile_id": profile_id }));
+        }
+    }
+}
+
 /// 模式 1：OpenAI 传统 Chat Completions（/v1/chat/completions）
 async fn chat_completions(
     State(_): State<()>,
@@ -3007,6 +3017,7 @@ async fn chat_completions(
             stats::update_last_tokens(idx, tc);
             if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
+            emit_balance_query_if_deepseek(&lease.profile_id, &ch.upstream_url);
             return (StatusCode::OK, Json(cc)).into_response();
         } else if upstream_fmt == UpstreamFormat::ChatCompletions {
             // 上游返回 Chat Completions 格式 -> 直通（已经是客户端期望的格式）
@@ -3027,6 +3038,7 @@ async fn chat_completions(
             stats::update_last_tokens(idx, tc);
             if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
+            emit_balance_query_if_deepseek(&lease.profile_id, &ch.upstream_url);
             return Response::builder().status(StatusCode::OK)
                 .header("content-type", content_type)
                 .body(Body::from(full)).unwrap();
@@ -3045,6 +3057,7 @@ async fn chat_completions(
             stats::update_last_tokens(idx, tc);
             if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
+            emit_balance_query_if_deepseek(&lease.profile_id, &ch.upstream_url);
             return (StatusCode::OK, Json(cc)).into_response();
         }
     }
@@ -3056,6 +3069,7 @@ async fn chat_completions(
     // 任务一旦 panic 就没人再递减 ACTIVE，槽位永久泄漏。
     let global_guard = lease.take_global_guard();
     let idx = global_guard.as_ref().map(|g| g.idx()).unwrap_or(0);
+    let lease_profile_id = lease.profile_id.clone();
 
     tokio::spawn(async move {
         let first = make_chunk(&model, json!({"role": "assistant"}), None);
@@ -3108,6 +3122,7 @@ async fn chat_completions(
         if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
         drop(lease); // 归还渠道槽位；此后不再使用 lease
         if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
+        emit_balance_query_if_deepseek(&lease_profile_id, &ch.upstream_url);
 
         let finish = make_chunk(&model, json!({}), Some(if tool_used { "tool_calls" } else { "stop" }));
         // 有界发送：客户端已断开时最多多活 TAIL_SEND_TIMEOUT，而不是永久挂着
@@ -3193,6 +3208,7 @@ async fn responses_api(
         stats::update_last_tokens(idx, tc);
         if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
         if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
+        emit_balance_query_if_deepseek(&lease.profile_id, &ch.upstream_url);
         return Response::builder().status(StatusCode::OK)
             .header("content-type", content_type)
             .body(Body::from(serde_json::to_string(&response_val).unwrap_or_default())).unwrap();
@@ -3204,6 +3220,7 @@ async fn responses_api(
     // 守卫移入任务再释放，panic 时靠 Drop 归还（见 chat_completions 的说明）
     let global_guard = lease.take_global_guard();
     let idx = global_guard.as_ref().map(|g| g.idx()).unwrap_or(0);
+    let lease_profile_id = lease.profile_id.clone();
     tokio::spawn(async move {
         let mut chars: u64 = 0;
         let mut usage = stats::TokenCounts { input: 0, output: 0, cached: 0 };
@@ -3273,6 +3290,7 @@ async fn responses_api(
         stats::update_last_tokens(idx, tc);
         if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
         if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
+        emit_balance_query_if_deepseek(&lease_profile_id, &ch.upstream_url);
     });
 
     sse_response(rx)
@@ -3333,6 +3351,7 @@ async fn anthropic_messages(
             stats::update_last_tokens(idx, tc.clone());
             if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
+            emit_balance_query_if_deepseek(&lease.profile_id, &ch.upstream_url);
             return (StatusCode::OK, Json(chat_completion_to_anthropic(&cc, &tc))).into_response();
         } else {
             // 上游返回 Chat 或 Anthropic 格式
@@ -3360,6 +3379,7 @@ async fn anthropic_messages(
             stats::update_last_tokens(idx, tc);
             if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
+            emit_balance_query_if_deepseek(&lease.profile_id, &ch.upstream_url);
             return (StatusCode::OK, Json(anthropic_val)).into_response();
         }
     }
@@ -3370,6 +3390,7 @@ async fn anthropic_messages(
     // 守卫移入任务再释放，panic 时靠 Drop 归还（见 chat_completions 的说明）
     let global_guard = lease.take_global_guard();
     let idx = global_guard.as_ref().map(|g| g.idx()).unwrap_or(0);
+    let lease_profile_id = lease.profile_id.clone();
     tokio::spawn(async move {
         let cb: Box<dyn Fn(u64) + Send> = Box::new(move |chars: u64| {
             stats::update_tokens_db_only(idx, stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 });
@@ -3403,6 +3424,7 @@ async fn anthropic_messages(
         stats::update_last_tokens(idx, tc);
         if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
         if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
+        emit_balance_query_if_deepseek(&lease_profile_id, &ch.upstream_url);
     });
 
     sse_response(rx)

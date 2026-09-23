@@ -243,6 +243,60 @@ fn summarize(text: &str) -> String {
     format!("{head}…")
 }
 
+/// 为指定渠道查询 DeepSeek 余额（不走 acquire_lease，直接用该渠道凭据）。
+/// 用于请求完成后按渠道查询余额，避免占用全局并发槽位。
+async fn query_channel_balance(upstream_url: &str, api_key: &str, currency: &str) -> Result<Value, String> {
+    if !is_official_upstream(upstream_url) {
+        return Ok(json!({
+            "supported": false,
+            "reason": "该渠道上游非 DeepSeek 官方，余额查询不可用",
+        }));
+    }
+    let key = api_key.trim().to_string();
+    if key.is_empty() {
+        return Err("API Key 未配置".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(|e| format!("余额查询 HTTP 客户端创建失败：{e}"))?;
+    let resp = client
+        .get(BALANCE_ENDPOINT)
+        .bearer_auth(&key)
+        .send()
+        .await
+        .map_err(|e| format!("余额查询请求失败：{e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "余额查询失败（HTTP {}）：{}",
+            status.as_u16(),
+            summarize(&text)
+        ));
+    }
+    let body: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("余额接口返回不是有效 JSON：{e}（{}）", summarize(&text)))?;
+    Ok(parse_balance(&body, currency))
+}
+
+/// 按 profile_id 查询指定渠道的余额（Tauri 命令）。
+/// 若 profile_id 为空则退化为 get_balance 的行为（取首个可用渠道）。
+#[tauri::command]
+pub async fn get_channel_balance(profile_id: String) -> Result<serde_json::Value, String> {
+    let cfg = config();
+    if !cfg.enabled {
+        return Ok(json!({ "supported": false, "reason": "余额查询未开启" }));
+    }
+    if !profile_id.is_empty() {
+        if let Some(ch) = crate::proxy::channel_config(&profile_id) {
+            return query_channel_balance(&ch.upstream_url, &ch.api_key, &cfg.currency).await;
+        }
+        return Ok(json!({ "supported": false, "reason": "未找到指定渠道" }));
+    }
+    get_balance().await
+}
+
 #[tauri::command]
 pub async fn get_balance() -> Result<serde_json::Value, String> {
     let cfg = config();

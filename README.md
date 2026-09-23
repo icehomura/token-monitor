@@ -49,7 +49,8 @@ SSE 流式透传，上游 5xx 自动重试。
 **探针与余额**
 
 - AI 服务探针：定期探测上游可用性，展示延迟与成功率
-- DeepSeek 余额：标题栏实时显示账户余额（仅官方上游）
+- DeepSeek 余额：标题栏实时显示账户余额（仅官方上游），每次请求完成后按渠道自动查询
+- 探针与余额设置自动保存，无需手动点击
 
 ## 配置
 
@@ -96,14 +97,20 @@ SSE 流式透传，上游 5xx 自动重试。
 ## 开发
 
 ```bash
-# 后端
-cargo run
+# 安装前端依赖
+bun install
 
-# 前端开发
-cd frontend && npm run dev
+# 仅前端开发（Vite 热更新）
+bun run dev
+
+# 完整 Tauri 开发（前端 + Rust 后端 + 热更新）
+bun run tauri dev
+
+# 构建发布版本
+bun run tauri build
 ```
 
-测试：`cargo test`（68 个单元 / 集成测试）
+后端测试：`cd src-tauri && cargo test`（68 个单元 / 集成测试）
 
 ## 技术栈
 
