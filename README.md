@@ -1,8 +1,23 @@
-# Token Monitor
+<p align="center">
+  <img src="icons/icon.png" alt="Token Monitor" width="128">
+</p>
 
-**简易 AI 网关**：本地代理 + RPM/TPM 实时统计，零配置开箱即用。
+<h1 align="center">Token Monitor</h1>
 
-支持 OpenAI / DeepSeek / Anthropic 等兼容上游的多渠道智能调度，适用于日常开发、API 调试和成本监控。
+<p align="center">
+  <strong>简易 AI 网关</strong>：本地代理 + RPM/TPM 实时统计，零配置开箱即用。
+</p>
+
+<p align="center">
+  <a href="https://github.com/icehomura/token-monitor/actions/workflows/build.yml"><img src="https://github.com/icehomura/token-monitor/actions/workflows/build.yml/badge.svg" alt="Build & Release"></a>
+  <a href="https://github.com/icehomura/token-monitor/releases/latest"><img src="https://img.shields.io/github/v/release/icehomura/token-monitor?label=latest" alt="Latest Release"></a>
+  <a href="https://github.com/icehomura/token-monitor/releases"><img src="https://img.shields.io/github/downloads/icehomura/token-monitor/total?label=downloads" alt="Downloads"></a>
+  <a href="https://github.com/icehomura/token-monitor/blob/main/LICENSE"><img src="https://img.shields.io/github/license/icehomura/token-monitor" alt="License"></a>
+</p>
+
+<p align="center">
+  支持 OpenAI / DeepSeek / Anthropic 等兼容上游的多渠道智能调度，适用于日常开发、API 调试和成本监控。
+</p>
 
 <p align="center">
   <img src="docs/screenshot.png" alt="Token Monitor 运行界面" width="820">
