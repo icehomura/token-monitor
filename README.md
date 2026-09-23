@@ -4,6 +4,10 @@
 
 支持 OpenAI / DeepSeek / Anthropic 等兼容上游的多渠道智能调度，适用于日常开发、API 调试和成本监控。
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="Token Monitor 运行界面" width="820">
+</p>
+
 ## 下载
 
 从 [GitHub Releases](https://github.com/icehomura/token-monitor/releases/latest) 下载对应平台安装包：
