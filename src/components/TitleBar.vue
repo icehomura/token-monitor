@@ -238,7 +238,7 @@ onBeforeUnmount(() => {
 }
 /* macOS：原生红绿灯占据左侧 ~70px，标题栏内容自动右移 */
 .titlebar--mac { padding-left: 80px; }
-.titlebar-brand { display: flex; align-items: center; gap: 10px; }
+.titlebar-brand { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
 .titlebar-brand strong { font-size: 14px; font-weight: 600; color: var(--text); }
 .concurrency-badge {
   font-size: 11px; color: var(--muted); background: var(--border);
