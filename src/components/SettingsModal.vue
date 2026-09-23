@@ -113,13 +113,29 @@
 
         <!-- ── Tab：界面与系统 ── -->
         <div v-show="activeTab === 'system'" class="tab-pane">
-        <!-- 当前状态 + 端口 -->
+        <!-- 关于 + 端口 -->
         <div class="grid-2">
-          <SettingsCard title="当前状态">
-            <div class="status-row">
-              <span class="status-icon">✓</span>
-              <span class="status-text">{{ settingsInfo }}</span>
+          <SettingsCard title="关于">
+            <div class="about-row">
+              <img src="/icons/icon.png" alt="Token Monitor" class="about-icon" />
+              <div class="about-info">
+                <span class="about-name">Token Monitor</span>
+                <span class="about-version">v{{ appVersion }}</span>
+              </div>
             </div>
+            <div class="about-links">
+              <a href="https://github.com/icehomura/token-monitor/releases" target="_blank" class="about-link">查看 Releases</a>
+              <a href="https://github.com/icehomura/token-monitor" target="_blank" class="about-link">GitHub 仓库</a>
+            </div>
+            <div class="settings-row">
+              <span class="settings-label">检查更新</span>
+              <BaseButton variant="primary" @click="checkForUpdate">
+                <span style="margin-right:4px">⟳</span> 检查更新
+              </BaseButton>
+            </div>
+            <template #hint>
+              <small :class="['ff-hint', updateMsgType]">{{ updateMsg }}</small>
+            </template>
           </SettingsCard>
           <SettingsCard title="服务端口" description="保存后自动重启监听">
             <div class="port-row">
@@ -226,6 +242,7 @@ import ThemeIcon from './ThemeIcon.vue'
 import ProfileEditModal from './ProfileEditModal.vue'
 import SchedulerStatus from './SchedulerStatus.vue'
 import { useTauri } from '../composables/useTauri'
+import { version as pkgVersion } from '../../package.json'
 
 const { invoke } = useTauri()
 
@@ -237,6 +254,11 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['close', 'update:themeName', 'update:convertUnits'])
+
+// ──────── 版本与更新 ────────
+const appVersion = ref(pkgVersion || '0.0.0')
+const updateMsg = ref('')
+const updateMsgType = ref('')
 
 // ──────── Tab 分组 ────────
 const DEFAULT_TAB = 'ai'
@@ -531,6 +553,28 @@ async function refreshChannelBalances() {
   channelBalances.value = result
 }
 
+// ──────── 检查更新 ────────
+async function checkForUpdate() {
+  updateMsg.value = '检查中…'; updateMsgType.value = ''
+  try {
+    const resp = await fetch('https://api.github.com/repos/icehomura/token-monitor/releases/latest')
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    const data = await resp.json()
+    const latestTag = (data.tag_name || '').replace(/^v/, '')
+    if (!latestTag) { updateMsg.value = '无法获取最新版本信息'; updateMsgType.value = ''; return }
+    if (latestTag === appVersion.value) {
+      updateMsg.value = `✓ 当前已是最新版本 v${appVersion.value}`
+      updateMsgType.value = 'ok'
+    } else {
+      updateMsg.value = `新版本 v${latestTag} 可用（当前 v${appVersion.value}）`
+      updateMsgType.value = ''
+    }
+  } catch (e) {
+    updateMsg.value = `检查失败：${String(e)}`
+    updateMsgType.value = 'err'
+  }
+}
+
 // ──────── 端口 ────────
 async function savePort() {
   portMsg.value = '重启中…'; portMsgType.value = ''
@@ -680,6 +724,16 @@ async function savePort() {
 /* 端口行 */
 .port-row { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; }
 .port-row .input-wrap { flex: 0 0 150px; min-width: 0; }
+
+/* 关于 */
+.about-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+.about-icon { width: 48px; height: 48px; border-radius: 10px; }
+.about-info { display: flex; flex-direction: column; gap: 2px; }
+.about-name { font-size: 15px; font-weight: 600; color: var(--text); }
+.about-version { font-size: 12px; color: var(--muted); }
+.about-links { display: flex; gap: 16px; margin-bottom: 10px; }
+.about-link { font-size: 12px; color: var(--blue); text-decoration: none; }
+.about-link:hover { text-decoration: underline; }
 
 /* 主题 */
 .theme-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
