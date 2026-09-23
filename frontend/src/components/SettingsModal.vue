@@ -31,10 +31,10 @@
         <!-- ── Tab：AI 服务 ── -->
         <div v-show="activeTab === 'ai'" class="tab-pane">
         <!-- 配置文件管理 -->
-        <SettingsCard title="AI 服务配置" description="管理多组 API 地址、模型和密钥配置，多个渠道自动调度" auto>
+        <SettingsCard title="渠道管理" description="管理多组上游 API 地址、密钥与模型，多个渠道自动调度" auto>
           <template #actions>
             <BaseButton variant="primary" @click="addNewProfile">
-              <span style="margin-right:4px">+</span> 新建配置文件
+              <span style="margin-right:4px">+</span> 添加渠道
             </BaseButton>
           </template>
           <div class="profile-list">
@@ -251,7 +251,7 @@ const emit = defineEmits(['close', 'update:themeName', 'update:convertUnits'])
 const DEFAULT_TAB = 'ai'
 const activeTab = ref(DEFAULT_TAB)
 const tabs = [
-  { id: 'ai', label: 'AI 服务' },
+  { id: 'ai', label: '渠道' },
   { id: 'probe', label: '探针' },
   { id: 'balance', label: '余额' },
   { id: 'system', label: '界面与系统' },

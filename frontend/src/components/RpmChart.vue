@@ -92,7 +92,7 @@ function renderChart() {
         textStyle: { color: tc.label, fontSize: 12 },
       },
       // 右侧两条轴需要额外留白，故 right 比 left 大
-      grid: { left: 56, right: 150, top: 36, bottom: 30 },
+      grid: { left: 56, right: 150, top: 36, bottom: 38 },
       xAxis: { type: 'category', data: props.labels, ...axis(), boundaryGap: true },
       yAxis: [
         {

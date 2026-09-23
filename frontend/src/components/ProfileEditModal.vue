@@ -3,10 +3,7 @@
     <div v-if="visible" class="modal-mask" @click.self="$emit('cancel')">
       <div class="modal">
         <div class="modal-head">
-          <h2>{{ isNew ? '新建配置文件' : '编辑配置文件' }}</h2>
-          <IconButton class="modal-close" title="关闭" @click="$emit('cancel')">
-            <span style="font-size:15px">✕</span>
-          </IconButton>
+          <h2>{{ isNew ? '新建渠道' : '编辑渠道' }}</h2>
         </div>
         <div class="modal-body">
           <div class="profile-form">
@@ -61,7 +58,7 @@
         <div class="modal-footer">
           <span v-if="saved" class="save-status ok">✓ 已保存</span>
           <span v-else-if="saving" class="save-status">保存中...</span>
-          <BaseButton @click="$emit('cancel')">关闭</BaseButton>
+          <BaseButton variant="primary" @click="debouncedSave(); $emit('cancel')">保存并关闭</BaseButton>
         </div>
       </div>
     </div>

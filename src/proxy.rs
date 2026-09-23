@@ -371,7 +371,7 @@ fn convert_messages(messages: &Value) -> Vec<Value> {
 
         // assistant 带工具调用 -> 文本消息(可选) + function_call 项
         if role == "assistant" && m.get("tool_calls").is_some() {
-            let parts: Vec<Value> = match content {
+            let mut parts: Vec<Value> = match content {
                 Some(Value::String(s)) if !s.is_empty() => vec![text_part(role, s)],
                 Some(Value::Array(list)) => list
                     .iter()
@@ -384,7 +384,15 @@ fn convert_messages(messages: &Value) -> Vec<Value> {
                 _ => vec![],
             };
             if !parts.is_empty() {
-                items.push(json!({"type": "message", "role": "assistant", "content": parts}));
+                let mut msg = json!({"type": "message", "role": "assistant", "content": parts});
+                // DeepSeek thinking mode：客户端必须把上一轮的 reasoning_content 传回
+                // 否则上游返回 400 invalid_request_error。直接透传到 Responses 格式。
+                if let Some(rc) = m.get("reasoning_content").and_then(|r| r.as_str()) {
+                    if !rc.is_empty() {
+                        msg["reasoning_content"] = json!(rc);
+                    }
+                }
+                items.push(msg);
             }
             for tc in m["tool_calls"].as_array().unwrap_or(&vec![]) {
                 let f = tc.get("function").cloned().unwrap_or(json!({}));
@@ -658,6 +666,27 @@ fn responses_items_to_chat_messages(items: &[Value]) -> Vec<Value> {
                     "content": output,
                 }));
             }
+            // DeepSeek thinking mode: Responses 格式下 reasoning 是独立的 output item，
+            // Chat 格式下它是 assistant.reasoning_content 字符串字段。
+            // 客户端必须把它传回上游，否则上游返回 400 invalid_request_error。
+            "reasoning" => {
+                let text = item.get("content")
+                    .and_then(|c| c.as_array())
+                    .map(|blocks| {
+                        blocks.iter()
+                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                    .unwrap_or_default();
+                if !text.is_empty() {
+                    messages.push(json!({
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": text,
+                    }));
+                }
+            }
             _ => {}
         }
     }
@@ -764,6 +793,16 @@ fn chat_to_anthropic_payload(body: &Value, stream: bool, model_override: &str) -
             // assistant 带 tool_calls
             if role == "assistant" && m.get("tool_calls").is_some() {
                 let mut blocks = Vec::new();
+                // DeepSeek thinking mode：reasoning_content 必须传回上游
+                // Anthropic 格式中它是一个 thinking 类型的内容块
+                if let Some(rc) = m.get("reasoning_content").and_then(|r| r.as_str()) {
+                    if !rc.is_empty() {
+                        blocks.push(json!({
+                            "type": "thinking",
+                            "thinking": rc,
+                        }));
+                    }
+                }
                 // 文本内容
                 let text = match content {
                     Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
@@ -1114,7 +1153,7 @@ fn make_chunk(model: &str, delta: Value, finish_reason: Option<&str>) -> Value {
 /// 消费上游 Responses API 的字节流，把转换后的 Chat Completions 流块直接写入 tx。
 /// 返回 (输出字符数估计, 是否用到工具调用)。
 /// on_tokens: 可选回调，每处理一个 SSE 事件时调用，参数为当前累计输出字符数。
-async fn convert_stream(
+async fn stream_responses_to_chat(
     upstream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
     model: String,
     tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
@@ -1168,6 +1207,21 @@ async fn convert_stream(
                             .send(Ok(sse_frame(&make_chunk(
                                 &model,
                                 json!({"content": delta}),
+                                None,
+                            ))))
+                            .await;
+                    }
+                }
+                // DeepSeek thinking mode: 流式 reasoning delta。
+                // Responses 格式下是 response.reasoning.delta / reasoning_content_delta；
+                // Chat 格式下是 assistant.reasoning_content。
+                // 把 reasoning 作为 Chat delta 里的 reasoning_content 字段透传。
+                "response.reasoning.delta" | "reasoning_content_delta" => {
+                    if let Some(delta) = evt.get("delta").and_then(|d| d.as_str()) {
+                        let _ = tx
+                            .send(Ok(sse_frame(&make_chunk(
+                                &model,
+                                json!({"reasoning_content": delta}),
                                 None,
                             ))))
                             .await;
@@ -1299,7 +1353,7 @@ fn anthropic_sse(event: &str, v: &Value) -> Vec<u8> {
 /// message_start -> (content_block_start -> content_block_delta* -> content_block_stop)*
 /// -> message_delta(stop_reason/usage) -> message_stop
 #[allow(unused_assignments)] // 宏展开后最后一次 started = true 不再被读，属预期
-async fn convert_stream_anthropic(
+async fn stream_responses_to_anthropic(
     upstream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
     model: String,
     tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
@@ -1312,6 +1366,7 @@ async fn convert_stream_anthropic(
 
     let mut started = false; // 已发送 message_start
     let mut text_index: Option<usize> = None; // 文本块的 block index（懒打开）
+    let mut thinking_index: Option<usize> = None; // thinking/reasoning 块的 block index
     let mut next_index = 0usize; // 下一个可分配的 block index
     let mut open_blocks: Vec<usize> = Vec::new(); // 已打开、尚未关闭的块（含文本与工具）
     let mut tool_blocks: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
@@ -1422,6 +1477,39 @@ async fn convert_stream_anthropic(
                                 }),
                             )))
                             .await;
+                    }
+                }
+                // DeepSeek thinking mode: Responses 格式下的 reasoning delta
+                // → Anthropic 格式的 thinking content_block
+                "response.reasoning.delta" | "reasoning_content_delta" => {
+                    if let Some(delta) = evt.get("delta").and_then(|d| d.as_str()) {
+                        ensure_started!();
+                        let bi = match thinking_index {
+                            Some(i) => i,
+                            None => {
+                                let i = next_index;
+                                next_index += 1;
+                                thinking_index = Some(i);
+                                open_blocks.push(i);
+                                let _ = tx.send(Ok(anthropic_sse(
+                                    "content_block_start",
+                                    &json!({
+                                        "type": "content_block_start",
+                                        "index": i,
+                                        "content_block": {"type": "thinking", "thinking": ""},
+                                    }),
+                                ))).await;
+                                i
+                            }
+                        };
+                        let _ = tx.send(Ok(anthropic_sse(
+                            "content_block_delta",
+                            &json!({
+                                "type": "content_block_delta",
+                                "index": bi,
+                                "delta": {"type": "thinking_delta", "thinking": delta},
+                            }),
+                        ))).await;
                     }
                 }
                 "response.output_item.added" => {
@@ -1597,7 +1685,7 @@ async fn passthrough_anthropic_stream(
 }
 
 /// 非流式聚合：上游 Chat Completions JSON -> 客户端 Responses JSON
-fn chat_json_to_responses(v: &Value, model: &str) -> Value {
+fn chat_to_responses(v: &Value, model: &str) -> Value {
     let msg = v.pointer("/choices/0/message").cloned().unwrap_or(json!({}));
     let mut output_items = Vec::new();
     if let Some(t) = msg.get("content").and_then(|c| c.as_str()) {
@@ -1631,7 +1719,7 @@ fn chat_json_to_responses(v: &Value, model: &str) -> Value {
 }
 
 /// 非流式聚合：上游 Anthropic JSON -> 客户端 Responses JSON
-fn anthropic_json_to_responses(v: &Value, model: &str) -> Value {
+fn anthropic_to_responses(v: &Value, model: &str) -> Value {
     let mut output_items = Vec::new();
     if let Some(content) = v.get("content").and_then(|c| c.as_array()) {
         for block in content {
@@ -1671,7 +1759,7 @@ fn anthropic_json_to_responses(v: &Value, model: &str) -> Value {
 }
 
 /// 非流式聚合：上游 Anthropic JSON -> 客户端 Chat Completions JSON
-fn anthropic_json_to_chat(v: &Value) -> Value {
+fn anthropic_to_chat(v: &Value) -> Value {
     let mut content_parts = Vec::new();
     let mut tool_calls = Vec::new();
     if let Some(content) = v.get("content").and_then(|c| c.as_array()) {
@@ -1716,9 +1804,13 @@ fn anthropic_json_to_chat(v: &Value) -> Value {
 }
 
 /// 非流式聚合：上游 Responses JSON -> 客户端 Chat Completions JSON
-fn responses_to_chat_json(v: &Value, model: &str) -> Value {
+fn responses_to_chat(v: &Value, model: &str) -> Value {
     let mut content_parts = Vec::new();
     let mut tool_calls = Vec::new();
+    // DeepSeek Responses 格式下 reasoning 是独立的 output item：
+    // {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "..."}]}
+    // Chat 格式下它是 assistant.reasoning_content 字符串字段。
+    let mut reasoning_text = String::new();
     if let Some(items) = v.get("output").and_then(|o| o.as_array()) {
         for item in items {
             match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
@@ -1728,6 +1820,19 @@ fn responses_to_chat_json(v: &Value, model: &str) -> Value {
                             if part.get("type").and_then(|t| t.as_str()) == Some("output_text") {
                                 if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
                                     if !t.is_empty() { content_parts.push(t.to_string()); }
+                                }
+                            }
+                        }
+                    }
+                }
+                "reasoning" => {
+                    // DeepSeek thinking mode: 提取 reasoning 内容
+                    if let Some(blocks) = item.get("content").and_then(|c| c.as_array()) {
+                        for block in blocks {
+                            if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                                if !t.is_empty() {
+                                    if !reasoning_text.is_empty() { reasoning_text.push('\n'); }
+                                    reasoning_text.push_str(t);
                                 }
                             }
                         }
@@ -1753,6 +1858,11 @@ fn responses_to_chat_json(v: &Value, model: &str) -> Value {
         "role": "assistant",
         "content": if text.is_empty() { Value::Null } else { json!(text) },
     });
+    // DeepSeek thinking mode: reasoning 内容通过 Chat 格式的 reasoning_content 字段传递。
+    // 客户端在下一轮请求中必须把它原样传回，否则上游返回 400。
+    if !reasoning_text.is_empty() {
+        message["reasoning_content"] = json!(reasoning_text);
+    }
     if has_tools {
         message["tool_calls"] = Value::Array(tool_calls);
     }
@@ -1772,11 +1882,18 @@ fn responses_to_chat_json(v: &Value, model: &str) -> Value {
 }
 
 /// 非流式聚合：上游 Chat Completions JSON -> Anthropic Messages JSON
-fn chat_json_to_anthropic(v: &Value) -> Value {
+fn chat_to_anthropic(v: &Value) -> Value {
     let model = v.get("model").cloned().unwrap_or(json!(""));
     let msg = v.pointer("/choices/0/message").cloned().unwrap_or(json!({}));
 
     let mut content: Vec<Value> = Vec::new();
+    // DeepSeek thinking mode: Chat 格式中 reasoning 在 assistant.reasoning_content，
+    // Anthropic 格式中它是 thinking 类型的内容块。
+    if let Some(rc) = msg.get("reasoning_content").and_then(|r| r.as_str()) {
+        if !rc.is_empty() {
+            content.push(json!({"type": "thinking", "thinking": rc}));
+        }
+    }
     if let Some(t) = msg.get("content").and_then(|c| c.as_str()) {
         if !t.is_empty() {
             content.push(json!({"type": "text", "text": t}));
@@ -1818,7 +1935,7 @@ fn chat_json_to_anthropic(v: &Value) -> Value {
 
 // ---------- 响应侧流式转换：上游 Chat SSE -> 客户端 Responses SSE ----------
 
-async fn convert_stream_chat_to_responses(
+async fn stream_chat_to_responses(
     upstream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
     model: String,
     tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
@@ -1894,7 +2011,7 @@ async fn convert_stream_chat_to_responses(
 
 // ---------- 响应侧流式转换：上游 Anthropic SSE -> 客户端 Responses SSE ----------
 
-async fn convert_stream_anthropic_to_responses(
+async fn stream_anthropic_to_responses(
     upstream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
     model: String,
     tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
@@ -1975,7 +2092,7 @@ async fn convert_stream_anthropic_to_responses(
 
 // ---------- 响应侧流式转换：上游 Chat SSE -> 客户端 Anthropic SSE ----------
 
-async fn convert_stream_chat_to_anthropic(
+async fn stream_chat_to_anthropic(
     upstream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
     model: String,
     tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
@@ -1987,6 +2104,7 @@ async fn convert_stream_chat_to_anthropic(
     let mut usage = stats::TokenCounts { input: 0, output: 0, cached: 0 };
     let mut started = false;
     let mut text_index: Option<usize> = None;
+    let mut thinking_index: Option<usize> = None;
     let mut next_index = 0usize;
     // 所有已打开但尚未闭合的 content block（文本 + 工具），收尾时统一关闭。
     // 每个 content_block_start 都**必须**有对应的 content_block_stop，
@@ -2094,6 +2212,31 @@ async fn convert_stream_chat_to_anthropic(
                     }
                 }
             }
+            // DeepSeek thinking mode: Chat 格式的 reasoning_content delta
+            // → Anthropic 格式的 thinking content_block
+            if let Some(rc) = obj.pointer("/choices/0/delta/reasoning_content").and_then(|r| r.as_str()) {
+                ensure_started!();
+                let bi = match thinking_index {
+                    Some(i) => i,
+                    None => {
+                        let i = next_index;
+                        next_index += 1;
+                        thinking_index = Some(i);
+                        open_blocks.push(i);
+                        let _ = tx.send(Ok(anthropic_sse("content_block_start", &json!({
+                            "type": "content_block_start",
+                            "index": i,
+                            "content_block": {"type": "thinking", "thinking": ""},
+                        })))).await;
+                        i
+                    }
+                };
+                let _ = tx.send(Ok(anthropic_sse("content_block_delta", &json!({
+                    "type": "content_block_delta",
+                    "index": bi,
+                    "delta": {"type": "thinking_delta", "thinking": rc},
+                })))).await;
+            }
             // usage from final chunk
             if let Some(u) = obj.get("usage") {
                 usage.input = u.pointer("/prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
@@ -2128,7 +2271,7 @@ async fn convert_stream_chat_to_anthropic(
 
 // ---------- 响应侧流式转换：上游 Anthropic SSE -> 客户端 Chat SSE ----------
 
-async fn convert_stream_anthropic_to_chat(
+async fn stream_anthropic_to_chat(
     upstream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
     model: String,
     tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
@@ -2604,7 +2747,7 @@ where
     let model_producer = model.clone();
     tokio::spawn(async move {
         let (_, tool_used, usage) =
-            convert_stream(upstream, model_producer.clone(), &tx, None).await;
+            stream_responses_to_chat(upstream, model_producer.clone(), &tx, None).await;
         let _ = usage_tx.send(usage);
         let finish = make_chunk(
             &model_producer,
@@ -2844,7 +2987,7 @@ async fn chat_completions(
                         .or_else(|| v.pointer("/usage/input_tokens_details/cached_tokens").and_then(|t| t.as_u64()))
                         .unwrap_or(0),
                 };
-                (responses_to_chat_json(&v, &model), tc)
+                (responses_to_chat(&v, &model), tc)
             } else {
                 // 把已读入的响应体重新包成流，复用流式聚合逻辑
                 let bytes = bytes::Bytes::from(full.into_bytes());
@@ -2896,7 +3039,7 @@ async fn chat_completions(
                 output: v.pointer("/usage/output_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
                 cached: 0,
             };
-            let cc = anthropic_json_to_chat(&v);
+            let cc = anthropic_to_chat(&v);
             let total_tokens = tc.input + tc.output;
             let idx = lease.disarm_global();
             stats::update_last_tokens(idx, tc);
@@ -2926,19 +3069,19 @@ async fn chat_completions(
         let result = tokio::time::timeout(STREAM_TIMEOUT, async {
             if to_responses {
                 // 上游 Responses SSE -> Chat Completions SSE。
-                // 必须用 `convert_stream`（它解析 response.output_text.delta /
+                // 必须用 `stream_responses_to_chat`（它解析 response.output_text.delta /
                 // response.usage 并产出 Chat chunk）。曾误用反方向的
-                // `convert_stream_chat_to_responses`，它只认 choices[].delta，
+                // `stream_chat_to_responses`，它只认 choices[].delta，
                 // 而 Responses 事件里没有该字段 —— 结果是流式对话返回空内容且
                 // 状态码 200，客户端完全无法察觉。
-                convert_stream(byte_stream, model.clone(), &tx, Some(cb)).await
+                stream_responses_to_chat(byte_stream, model.clone(), &tx, Some(cb)).await
             } else if upstream_fmt == UpstreamFormat::ChatCompletions {
                 // 上游 Chat SSE -> Chat SSE 直通
                 let (chars, tc) = passthrough_chat_stream(byte_stream, model.clone(), &tx, Some(cb)).await;
                 (chars, false, tc)
             } else {
                 // 上游 Anthropic SSE -> Chat SSE
-                let (_c, used, tc) = convert_stream_anthropic_to_chat(byte_stream, model.clone(), &tx, Some(cb)).await;
+                let (_c, used, tc) = stream_anthropic_to_chat(byte_stream, model.clone(), &tx, Some(cb)).await;
                 // 必须原样透传工具标志位：丢成 false 会让 finish_reason 恒为 "stop"，
                 // OpenAI 客户端据此认为模型自然结束，工具被静默丢弃。
                 (_c, used, tc)
@@ -3020,8 +3163,8 @@ async fn responses_api(
         // 转换响应为 Responses 格式
         let response_val = match upstream_fmt {
             UpstreamFormat::Responses => upstream_val.clone(),
-            UpstreamFormat::ChatCompletions => chat_json_to_responses(&upstream_val, &model),
-            UpstreamFormat::Anthropic => anthropic_json_to_responses(&upstream_val, &model),
+            UpstreamFormat::ChatCompletions => chat_to_responses(&upstream_val, &model),
+            UpstreamFormat::Anthropic => anthropic_to_responses(&upstream_val, &model),
         };
         let tc = match upstream_fmt {
             UpstreamFormat::Responses => {
@@ -3103,7 +3246,7 @@ async fn responses_api(
                 }
                 UpstreamFormat::ChatCompletions => {
                     // 上游 Chat SSE -> Responses SSE
-                    let (c, _, u) = convert_stream_chat_to_responses(byte_stream, model.clone(), &tx, Some(Box::new(move |chars: u64| {
+                    let (c, _, u) = stream_chat_to_responses(byte_stream, model.clone(), &tx, Some(Box::new(move |chars: u64| {
                         stats::update_tokens_db_only(idx, stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 });
                         if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
                     }))).await;
@@ -3111,7 +3254,7 @@ async fn responses_api(
                 }
                 UpstreamFormat::Anthropic => {
                     // 上游 Anthropic SSE -> Responses SSE
-                    let (c, _, u) = convert_stream_anthropic_to_responses(byte_stream, model.clone(), &tx, Some(Box::new(move |chars: u64| {
+                    let (c, _, u) = stream_anthropic_to_responses(byte_stream, model.clone(), &tx, Some(Box::new(move |chars: u64| {
                         stats::update_tokens_db_only(idx, stats::TokenCounts { input: 0, output: chars.div_ceil(3), cached: 0 });
                         if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
                     }))).await;
@@ -3202,7 +3345,7 @@ async fn anthropic_messages(
                     output: cc.pointer("/usage/completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
                     cached: 0,
                 };
-                (chat_json_to_anthropic(&cc), tc)
+                (chat_to_anthropic(&cc), tc)
             } else {
                 // Anthropic 直通
                 let tc = stats::TokenCounts {
@@ -3234,11 +3377,11 @@ async fn anthropic_messages(
         });
         let result = tokio::time::timeout(STREAM_TIMEOUT, async {
             if to_responses {
-                // 上游 Responses SSE -> Anthropic SSE（复用现有 convert_stream_anthropic）
-                convert_stream_anthropic(byte_stream, model.clone(), &tx, Some(cb)).await
+                // 上游 Responses SSE -> Anthropic SSE（复用现有 stream_responses_to_anthropic）
+                stream_responses_to_anthropic(byte_stream, model.clone(), &tx, Some(cb)).await
             } else if upstream_fmt == UpstreamFormat::ChatCompletions {
                 // 上游 Chat SSE -> Anthropic SSE
-                let (c, tc) = convert_stream_chat_to_anthropic(byte_stream, model.clone(), &tx, Some(cb)).await;
+                let (c, tc) = stream_chat_to_anthropic(byte_stream, model.clone(), &tx, Some(cb)).await;
                 (c, tc)
             } else {
                 // Anthropic 直通
@@ -3967,7 +4110,7 @@ mod channel_routing_tests {
     }
 
     /// 回归保护：`to_responses` 分支曾调用**反方向**的转换器
-    /// （`convert_stream_chat_to_responses` 只解析 `choices[].delta`），
+    /// （`stream_chat_to_responses` 只解析 `choices[].delta`），
     /// 而 Responses 上游的事件里根本没有该字段 —— 结果是流式对话返回**空内容**，
     /// 状态码却是 200，客户端完全无法察觉。这是默认配置下的主路径。
     #[tokio::test(flavor = "multi_thread")]
