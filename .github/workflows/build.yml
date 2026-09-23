@@ -2,6 +2,7 @@ name: Build & Release
 
 on:
   push:
+    branches: [main]
     tags:
       - "v*"
   workflow_dispatch:
@@ -156,7 +157,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # ────────────── Release ──────────────
+  # ────────────── 正式 Release（tag 触发） ──────────────
   release:
     needs: [windows, macos, linux]
     runs-on: ubuntu-latest
@@ -215,3 +216,59 @@ jobs:
             artifacts/linux-aarch64/**/*.deb
           draft: false
           generate_release_notes: true
+
+  # ────────────── CI Latest Build（main 分支 push 触发） ──────────────
+  latest:
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows
+          path: artifacts/windows
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-x64
+          path: artifacts/macos-x64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-arm64
+          path: artifacts/macos-arm64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64
+          path: artifacts/linux-x86_64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-aarch64
+          path: artifacts/linux-aarch64
+
+      - name: Delete old latest release
+        run: gh release delete latest --yes --cleanup-tag || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Token Monitor (latest CI build)"
+          files: |
+            artifacts/windows/**/*.exe
+            artifacts/macos-x64/**/*.dmg
+            artifacts/macos-arm64/**/*.dmg
+            artifacts/linux-x86_64/**/*.AppImage
+            artifacts/linux-x86_64/**/*.deb
+            artifacts/linux-aarch64/**/*.AppImage
+            artifacts/linux-aarch64/**/*.deb
+          draft: false
+          prerelease: true
+          body: |
+            自动构建于 ${{ github.sha }} — 始终指向 main 分支最新提交。
+            正式版本请查看 [Releases](https://github.com/icehomura/token-monitor/releases) 页面。
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
