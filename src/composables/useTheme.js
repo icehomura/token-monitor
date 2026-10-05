@@ -7,8 +7,8 @@ const themeName = ref(localStorage.getItem(STORAGE_KEY) || 'dark')
 
 export const themeColors = computed(() =>
   themeName.value === 'light'
-    ? { axis: '#d7dee9', label: '#66738c', split: '#e8edf4', blue: '#2f6fe4', green: '#149e78' }
-    : { axis: '#263049', label: '#8b97b0', split: '#1c2436', blue: '#4f8cff', green: '#35d0a5' }
+    ? { axis: '#d7dee9', label: '#66738c', split: '#e8edf4', blue: '#2f6fe4', green: '#149e78', cache: '#7d88a8' }
+    : { axis: '#263049', label: '#8b97b0', split: '#1c2436', blue: '#4f8cff', green: '#35d0a5', cache: '#7c88ad' }
 )
 
 export function isLight() {
