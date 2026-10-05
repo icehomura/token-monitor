@@ -28,6 +28,7 @@ const props = defineProps({
   rpms: { type: Array, default: () => [] },
   tpms: { type: Array, default: () => [] },
   inputTpms: { type: Array, default: () => [] },
+  cachedTpms: { type: Array, default: () => [] },
   convertUnits: { type: Boolean, default: false },
 })
 

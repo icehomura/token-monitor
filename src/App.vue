@@ -20,6 +20,7 @@
       :rpms="stats.rpms"
       :tpms="stats.tpms"
       :inputTpms="stats.inputTokensPerMin"
+      :cachedTpms="stats.cachedTokensPerMin"
       :convertUnits="convertUnits"
     />
   </section>
