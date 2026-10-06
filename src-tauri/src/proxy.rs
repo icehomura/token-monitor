@@ -2953,10 +2953,14 @@ fn note_upstream_feedback(profile_id: &str, status: StatusCode) {
     }
 }
 
-/// 若渠道上游为 DeepSeek 官方，向前端发射余额查询触发事件。
+/// 若渠道可能支持余额查询，向前端发射余额查询触发事件。
 /// 用于每次请求完成后按渠道动态查询余额。
-fn emit_balance_query_if_deepseek(profile_id: &str, upstream_url: &str) {
-    if crate::balance::is_official_upstream(upstream_url) {
+///
+/// 判据收敛在 `balance::is_balance_candidate`（DeepSeek 官方 / 可推导出 sub2api
+/// 用量接口的渠道）。已知不提供余额接口的渠道不再被事件唤醒，避免前端对它们反复轮询；
+/// 具体支持与否由 balance 层探测后决定。
+fn emit_balance_query_trigger(profile_id: &str, upstream_url: &str) {
+    if crate::balance::is_balance_candidate(upstream_url) {
         if let Some(h) = APP_HANDLE.get() {
             let _ = h.emit("balance-query-triggered", serde_json::json!({ "profile_id": profile_id }));
         }
@@ -3048,7 +3052,7 @@ async fn chat_completions(
             stats::update_last_tokens(idx, tc);
             if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
-            emit_balance_query_if_deepseek(&lease.profile_id, &ch.upstream_url);
+            emit_balance_query_trigger(&lease.profile_id, &ch.upstream_url);
             return (StatusCode::OK, Json(cc)).into_response();
         } else if upstream_fmt == UpstreamFormat::ChatCompletions {
             // 上游返回 Chat Completions 格式 -> 直通（已经是客户端期望的格式）
@@ -3069,7 +3073,7 @@ async fn chat_completions(
             stats::update_last_tokens(idx, tc);
             if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
-            emit_balance_query_if_deepseek(&lease.profile_id, &ch.upstream_url);
+            emit_balance_query_trigger(&lease.profile_id, &ch.upstream_url);
             return Response::builder().status(StatusCode::OK)
                 .header("content-type", content_type)
                 .body(Body::from(full)).unwrap();
@@ -3088,7 +3092,7 @@ async fn chat_completions(
             stats::update_last_tokens(idx, tc);
             if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
-            emit_balance_query_if_deepseek(&lease.profile_id, &ch.upstream_url);
+            emit_balance_query_trigger(&lease.profile_id, &ch.upstream_url);
             return (StatusCode::OK, Json(cc)).into_response();
         }
     }
@@ -3153,7 +3157,7 @@ async fn chat_completions(
         if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
         drop(lease); // 归还渠道槽位；此后不再使用 lease
         if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
-        emit_balance_query_if_deepseek(&lease_profile_id, &ch.upstream_url);
+        emit_balance_query_trigger(&lease_profile_id, &ch.upstream_url);
 
         let finish = make_chunk(&model, json!({}), Some(if tool_used { "tool_calls" } else { "stop" }));
         // 有界发送：客户端已断开时最多多活 TAIL_SEND_TIMEOUT，而不是永久挂着
@@ -3239,7 +3243,7 @@ async fn responses_api(
         stats::update_last_tokens(idx, tc);
         if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
         if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
-        emit_balance_query_if_deepseek(&lease.profile_id, &ch.upstream_url);
+        emit_balance_query_trigger(&lease.profile_id, &ch.upstream_url);
         return Response::builder().status(StatusCode::OK)
             .header("content-type", content_type)
             .body(Body::from(serde_json::to_string(&response_val).unwrap_or_default())).unwrap();
@@ -3321,7 +3325,7 @@ async fn responses_api(
         stats::update_last_tokens(idx, tc);
         if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
         if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
-        emit_balance_query_if_deepseek(&lease_profile_id, &ch.upstream_url);
+        emit_balance_query_trigger(&lease_profile_id, &ch.upstream_url);
     });
 
     sse_response(rx)
@@ -3382,7 +3386,7 @@ async fn anthropic_messages(
             stats::update_last_tokens(idx, tc.clone());
             if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
-            emit_balance_query_if_deepseek(&lease.profile_id, &ch.upstream_url);
+            emit_balance_query_trigger(&lease.profile_id, &ch.upstream_url);
             return (StatusCode::OK, Json(chat_completion_to_anthropic(&cc, &tc))).into_response();
         } else {
             // 上游返回 Chat 或 Anthropic 格式
@@ -3410,7 +3414,7 @@ async fn anthropic_messages(
             stats::update_last_tokens(idx, tc);
             if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
             if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
-            emit_balance_query_if_deepseek(&lease.profile_id, &ch.upstream_url);
+            emit_balance_query_trigger(&lease.profile_id, &ch.upstream_url);
             return (StatusCode::OK, Json(anthropic_val)).into_response();
         }
     }
@@ -3455,7 +3459,7 @@ async fn anthropic_messages(
         stats::update_last_tokens(idx, tc);
         if let Some(sched) = SCHEDULER.get() { sched.record_request(&lease.profile_id, total_tokens); }
         if let Some(h) = APP_HANDLE.get() { let _ = h.emit("stats-updated", ()); }
-        emit_balance_query_if_deepseek(&lease_profile_id, &ch.upstream_url);
+        emit_balance_query_trigger(&lease_profile_id, &ch.upstream_url);
     });
 
     sse_response(rx)
