@@ -418,10 +418,16 @@ fn convert_messages(messages: &Value) -> Vec<Value> {
                                 role,
                                 p.get("text").and_then(|t| t.as_str()).unwrap_or(""),
                             )),
-                            "image_url" => Some(json!({
-                                "type": "image_url",
-                                "image_url": {"url": p.pointer("/image_url/url").and_then(|u| u.as_str()).unwrap_or("")}
-                            })),
+                            // Chat 的 image_url 部件 -> Responses 的 input_image。
+                            // 注意 Responses 的 image_url 是字符串，不是 {url} 对象；
+                            // 直接透传成 image_url 会让上游报 unknown variant。
+                            "image_url" => {
+                                let url = p
+                                    .pointer("/image_url/url")
+                                    .and_then(|u| u.as_str())
+                                    .unwrap_or("");
+                                Some(json!({"type": "input_image", "image_url": url}))
+                            }
                             _ => None,
                         }
                     })
@@ -3498,6 +3504,37 @@ mod channel_routing_tests {
             upstream_format: UpstreamFormat::Responses,
             model_override: String::new(),
         }
+    }
+
+    /// 回归保护：Chat 的 `image_url` 部件曾被原样透传进 Responses 的 `input`，
+    /// 上游直接 422 `unknown variant image_url, expected ... input_image ...`。
+    /// 正确形态是 `{"type":"input_image","image_url":"<字符串>"}`。
+    #[test]
+    fn chat_image_url_becomes_responses_input_image() {
+        let messages = json!([{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "描述这张图"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+            ]
+        }]);
+
+        let items = convert_messages(&messages);
+        let parts = items[0]
+            .get("content")
+            .and_then(|c| c.as_array())
+            .expect("user 消息应带内容数组");
+        assert_eq!(parts[0].get("type").and_then(|t| t.as_str()), Some("input_text"));
+        assert_eq!(parts[1].get("type").and_then(|t| t.as_str()), Some("input_image"));
+        assert_eq!(
+            parts[1].get("image_url").and_then(|u| u.as_str()),
+            Some("data:image/png;base64,AAAA"),
+            "Responses 的 image_url 必须是字符串，不是 {{url}} 对象"
+        );
+        assert!(
+            parts.iter().all(|p| p.get("type").and_then(|t| t.as_str()) != Some("image_url")),
+            "input 中不应再出现上游不识别的 image_url 变体"
+        );
     }
 
     /// 渠道当前在飞并发数（与并发上限无关，适合做稳定的断言）
