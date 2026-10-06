@@ -177,11 +177,6 @@ pub fn upstream_url() -> String {
     probe_channel().upstream_url.trim().to_string()
 }
 
-/// 探针 / 余额使用的 API Key，口径同 `upstream_url()`
-pub fn default_api_key() -> String {
-    probe_channel().api_key
-}
-
 /// 探针 / 余额使用的渠道凭据：取首个启用渠道，无启用渠道时回退全局配置。
 ///
 /// 动态调度下不存在单一「当前上游」，用首个启用渠道代表整体可用性；
@@ -1681,7 +1676,7 @@ async fn passthrough_anthropic_stream(
     let mut buf: Vec<u8> = Vec::new();
     let mut out_chars: u64 = 0;
     let mut usage = stats::TokenCounts { input: 0, output: 0, cached: 0 };
-    'outer: while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = stream.next().await {
         let Ok(bytes) = chunk else { break };
         if tx.send(Ok(bytes.to_vec())).await.is_err() { break; }
         buf.extend_from_slice(&bytes);
@@ -1968,7 +1963,7 @@ fn chat_to_anthropic(v: &Value) -> Value {
 
 async fn stream_chat_to_responses(
     upstream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
-    model: String,
+    _model: String,
     tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
     on_tokens: Option<Box<dyn Fn(u64) + Send + 'static>>,
 ) -> (u64, bool, stats::TokenCounts) {
@@ -2044,7 +2039,7 @@ async fn stream_chat_to_responses(
 
 async fn stream_anthropic_to_responses(
     upstream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
-    model: String,
+    _model: String,
     tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
     on_tokens: Option<Box<dyn Fn(u64) + Send + 'static>>,
 ) -> (u64, bool, stats::TokenCounts) {
@@ -2054,7 +2049,7 @@ async fn stream_anthropic_to_responses(
     let mut used_tool_calls = false;
     let mut usage = stats::TokenCounts { input: 0, output: 0, cached: 0 };
 
-    'outer: while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = stream.next().await {
         let Ok(bytes) = chunk else { break };
         buf.extend_from_slice(&bytes);
         while let Some((end, delim)) = find_sse_boundary(&buf) {
@@ -2147,23 +2142,30 @@ async fn stream_chat_to_anthropic(
     let mut tool_blocks: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
     let mut used_tool_calls = false;
 
+    // message_start 帧：只负责发送，不改状态。
+    macro_rules! send_message_start {
+        () => {
+            let _ = tx.send(Ok(anthropic_sse("message_start", &json!({
+                "type": "message_start",
+                "message": {
+                    "id": format!("msg_{}", next_request_id()),
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                },
+            })))).await;
+        };
+    }
+    // 首次需要时补发 message_start，并置位避免重复。
     macro_rules! ensure_started {
         () => {
             if !started {
                 started = true;
-                let _ = tx.send(Ok(anthropic_sse("message_start", &json!({
-                    "type": "message_start",
-                    "message": {
-                        "id": format!("msg_{}", next_request_id()),
-                        "type": "message",
-                        "role": "assistant",
-                        "model": model,
-                        "content": [],
-                        "stop_reason": Value::Null,
-                        "stop_sequence": Value::Null,
-                        "usage": {"input_tokens": 0, "output_tokens": 0},
-                    },
-                })))).await;
+                send_message_start!();
             }
         };
     }
@@ -2276,7 +2278,11 @@ async fn stream_chat_to_anthropic(
             }
         }
     }
-    ensure_started!();
+    // 空流也要先补发 message_start；这是最后一次用到 `started`，故直接用
+    // send_message_start!（不再置位，避免「赋值后从未读取」告警）。
+    if !started {
+        send_message_start!();
+    }
     // 关闭所有已打开的块——文本块与工具块一视同仁。
     // 曾只关闭文本块，导致 tool_use 块永远停在不闭合状态，工具调用静默失效。
     // 顺序即打开顺序；Anthropic 规范按 index 寻址，不依赖闭合顺序。
@@ -2330,7 +2336,7 @@ async fn stream_anthropic_to_chat(
         };
     }
 
-    'outer: while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = stream.next().await {
         let Ok(bytes) = chunk else { break };
         buf.extend_from_slice(&bytes);
         while let Some((end, delim)) = find_sse_boundary(&buf) {

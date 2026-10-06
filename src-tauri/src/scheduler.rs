@@ -420,6 +420,9 @@ impl Scheduler {
     /// 必须用 CAS 循环而不是 `load` + `store`：后者不是原子读改写，
     /// 并发下两个请求会读到同一个旧值再各自写回，计数比实际占用少，
     /// 渠道并发上限会被突破。参见 `concurrent_acquire_never_exceeds_limit`。
+    // `fetch_update` 在 Rust 1.95 才被重命名为 `try_update`（纯改名，语义一致）；
+    // 保留旧名以兼容 Cargo.toml 声明的 rust-version = 1.77。
+    #[allow(deprecated)]
     pub fn acquire_slot(&self, profile_id: &str) -> bool {
         let channels = self.channels.read().unwrap();
         if let Some(ch) = channels.iter().find(|c| c.profile_id == profile_id) {
@@ -441,6 +444,7 @@ impl Scheduler {
     /// 同 `acquire_slot`：必须 CAS，否则并发释放会互相覆盖导致只减一次，
     /// 计数虚高不归零，渠道被判为「永远已满」。参见
     /// `concurrent_release_drains_counter_completely`。
+    #[allow(deprecated)] // 同上：`fetch_update` 是 1.95 前的兼容名
     pub fn release_slot(&self, profile_id: &str) {
         let channels = self.channels.read().unwrap();
         if let Some(ch) = channels.iter().find(|c| c.profile_id == profile_id) {
