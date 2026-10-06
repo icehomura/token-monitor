@@ -34,7 +34,7 @@ token-monitor/              # 项目根目录（前端根）
 │       ├── main.rs         # Tauri 命令注册、配置管理
 │       ├── proxy.rs        # HTTP 代理核心（路由、格式转换、AIMD 调度）
 │       ├── scheduler.rs    # 多渠道调度器（加权随机 + AIMD 自适应并发）
-│       ├── balance.rs      # DeepSeek 余额查询
+│       ├── balance.rs      # 余额查询（DeepSeek 官方 / sub2api 中转站）
 │       ├── probe.rs        # AI 服务探针
 │       └── stats.rs        # SQLite 统计存储、并发槽位管理
 ├── icons/                  # 应用图标
@@ -79,10 +79,14 @@ cd src-tauri && cargo test
 - 常用事件：`stats-updated`、`balance-query-triggered`、`close-requested`
 
 ### 余额查询 (balance.rs)
-- 仅 DeepSeek 官方上游 (`api.deepseek.com`) 支持余额查询
-- `get_balance`: 走 acquire_lease 闸门，占用并发槽位
+- 按 host 分派两类上游，其余一律返回「未提供兼容的余额接口」：
+  - DeepSeek 官方 (`api.deepseek.com`) → `GET /user/balance`
+  - sub2api 兼容中转站 → `GET {origin}/v1/usage`（探测即识别：响应带 `mode` 字段即为支持）
+- `get_balance`: 走 acquire_lease 闸门，占用并发槽位；已知不支持的渠道免占槽早退
 - `get_channel_balance(profile_id)`: 按指定渠道直接查询，不占并发槽位
-- 金额以字符串原样透传，不做浮点转换
+- 确认不支持的余额端点会进负缓存（以端点为键，渠道地址变更即自动失效），避免反复探测
+- `is_balance_candidate` 是探针事件与免占槽早退的共用判据，避免两处口径分叉
+- 金额统一定型为两位小数字符串透传，不做浮点转换
 
 ## Code Conventions
 
@@ -106,6 +110,6 @@ cd src-tauri && cargo test
 
 ## Testing
 
-- 后端：`cd src-tauri && cargo test` (68 个单元/集成测试)
+- 后端：`cd src-tauri && cargo test` (74 个单元/集成测试)
 - 重点测试模块：balance (余额解析)、proxy (路由/格式转换)、scheduler (并发调度)
 - 前端无自动化测试，通过 `bun run dev` + Tauri 手动验证
