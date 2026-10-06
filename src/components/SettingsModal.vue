@@ -242,6 +242,7 @@ import ThemeIcon from './ThemeIcon.vue'
 import ProfileEditModal from './ProfileEditModal.vue'
 import SchedulerStatus from './SchedulerStatus.vue'
 import { useTauri } from '../composables/useTauri'
+import { fmtBalance } from '../utils/format'
 import { version as pkgVersion } from '../../package.json'
 
 const { invoke } = useTauri()
@@ -521,8 +522,8 @@ async function refreshBalance() {
       balanceInfo.value = b.reason || '当前上游不支持余额查询'
       balanceInfoType.value = ''
     } else if (b.available === true) {
-      const sym = (b.currency || balanceCurrency.value) === 'USD' ? '$' : '¥'
-      balanceInfo.value = `余额 ${sym}${b.total != null ? b.total : '--'}`
+      // 响应自带币种（DeepSeek 为所选币种，sub2api 为 unit），缺失时才回落到设置项
+      balanceInfo.value = `余额 ${fmtBalance(b.currency || balanceCurrency.value, b.total)}`
       balanceInfoType.value = 'ok'
     } else {
       balanceInfo.value = b.reason || '余额暂不可用'
@@ -534,7 +535,7 @@ async function refreshBalance() {
   }
 }
 
-// 逐渠道查询余额（仅对 DeepSeek 官方渠道有效）
+// 逐渠道查询余额（DeepSeek 官方与 sub2api 兼容中转站均支持，不支持时留空）
 async function refreshChannelBalances() {
   const result = {}
   for (const p of profiles.value) {
@@ -543,8 +544,7 @@ async function refreshChannelBalances() {
       if (b.supported === false || b.available !== true) {
         result[p.id] = { text: '', ok: false }
       } else {
-        const sym = (b.currency || balanceCurrency.value) === 'USD' ? '$' : '¥'
-        result[p.id] = { text: `${sym}${b.total || '--'}`, ok: true }
+        result[p.id] = { text: fmtBalance(b.currency, b.total), ok: true }
       }
     } catch {
       result[p.id] = { text: '', ok: false }

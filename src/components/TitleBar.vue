@@ -8,7 +8,7 @@
       </span>
     </div>
     <div class="titlebar-actions">
-      <!-- DeepSeek 余额：只读展示，不是按钮/输入框，因此天然作为拖拽把手 -->
+      <!-- 账户余额：只读展示，不是按钮/输入框，因此天然作为拖拽把手 -->
       <span
         v-if="balanceVisible"
         class="balance-badge"
@@ -54,6 +54,7 @@
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useTauri } from '../composables/useTauri'
 import IconButton from './base/IconButton.vue'
+import { fmtBalance } from '../utils/format'
 
 defineProps({ concurrency: { type: Number, default: 0 } })
 defineEmits(['open-settings'])
@@ -65,7 +66,7 @@ const isMaximized = ref(false)
 const titlebarRef = ref(null)
 const isMac = /mac|darwin/i.test(navigator.userAgent)
 
-// ---- DeepSeek 余额（组件自持状态，不依赖父组件传参） ----
+// ---- 账户余额（组件自持状态，不依赖父组件传参） ----
 const balanceVisible = ref(false)
 const balance = ref(null)
 
@@ -86,18 +87,22 @@ const balanceText = computed(() => {
   if (!b) return ''
   if (b.supported === false) return b.reason || '余额不可用'
   if (b.available === true) {
-    const symbol = b.currency === 'USD' ? '$' : '¥'
     // 余额是后端返回的字符串，直接拼接，不做浮点转换
-    return `${symbol}${b.total || '--'}`
+    return fmtBalance(b.currency, b.total)
   }
   return b.reason || '余额获取失败'
 })
 
 const balanceTitle = computed(() => {
   const b = balance.value
-  if (!b) return 'DeepSeek 余额'
+  if (!b) return '账户余额'
   if (b.supported === false) return `余额查询不可用：${b.reason || '当前上游不支持'}`
-  if (b.available === true) return `DeepSeek 余额 ${b.currency || 'CNY'} ${b.total || ''}`
+  if (b.available === true) {
+    // plan / mode 来自 sub2api（如「钱包余额」/「unrestricted」），DeepSeek 无此字段
+    const label = [b.plan, b.mode].filter(Boolean).join(' · ')
+    const amount = [b.currency, b.total].filter(Boolean).join(' ')
+    return `账户余额${label ? `（${label}）` : ''} ${amount}`.trim()
+  }
   return `余额获取失败：${b.reason || '未知原因'}`
 })
 

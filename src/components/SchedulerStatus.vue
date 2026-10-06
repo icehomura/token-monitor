@@ -43,6 +43,7 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
 import { useTauri } from '../composables/useTauri'
+import { fmtBalance } from '../utils/format'
 import SettingsCard from './SettingsCard.vue'
 
 const { invoke } = useTauri()
@@ -66,8 +67,7 @@ async function refreshBalances() {
       if (b.supported === false || b.available !== true) {
         result[ch.profile_id] = { text: '', ok: false }
       } else {
-        const sym = b.currency === 'USD' ? '$' : '¥'
-        result[ch.profile_id] = { text: `${sym}${b.total || '--'}`, ok: true }
+        result[ch.profile_id] = { text: fmtBalance(b.currency, b.total), ok: true }
       }
     } catch {
       result[ch.profile_id] = { text: '', ok: false }
