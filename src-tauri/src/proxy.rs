@@ -321,6 +321,17 @@ fn text_part(role: &str, text: &str) -> Value {
     })
 }
 
+/// DeepSeek thinking mode：Chat 格式的 `assistant.reasoning_content` 字符串，
+/// 对应 Responses 输入里独立的 reasoning item（内容块类型为 `reasoning_text`）。
+/// 客户端必须把上一轮的 reasoning 原样传回，否则上游返回 400
+/// `The reasoning_text in the thinking mode must be passed back to the API.`
+fn reasoning_item(text: &str) -> Value {
+    json!({
+        "type": "reasoning",
+        "content": [{"type": "reasoning_text", "text": text}],
+    })
+}
+
 /// Chat 格式 {"type":"function","function":{...}} -> Responses 格式 {"type":"function","name":...}
 fn convert_tools(tools: Option<&Value>) -> Option<Value> {
     let arr = tools?.as_array()?;
@@ -369,9 +380,16 @@ fn convert_messages(messages: &Value) -> Vec<Value> {
             continue;
         }
 
-        // assistant 带工具调用 -> 文本消息(可选) + function_call 项
+        // assistant 带工具调用 -> reasoning(可选) + 文本消息(可选) + function_call 项
         if role == "assistant" && m.get("tool_calls").is_some() {
-            let mut parts: Vec<Value> = match content {
+            // DeepSeek thinking mode：reasoning 在 Responses 输入里是独立 item，
+            // 必须原样传回，否则上游返回 400（reasoning_text must be passed back）。
+            if let Some(rc) = m.get("reasoning_content").and_then(|r| r.as_str()) {
+                if !rc.is_empty() {
+                    items.push(reasoning_item(rc));
+                }
+            }
+            let parts: Vec<Value> = match content {
                 Some(Value::String(s)) if !s.is_empty() => vec![text_part(role, s)],
                 Some(Value::Array(list)) => list
                     .iter()
@@ -384,15 +402,7 @@ fn convert_messages(messages: &Value) -> Vec<Value> {
                 _ => vec![],
             };
             if !parts.is_empty() {
-                let mut msg = json!({"type": "message", "role": "assistant", "content": parts});
-                // DeepSeek thinking mode：客户端必须把上一轮的 reasoning_content 传回
-                // 否则上游返回 400 invalid_request_error。直接透传到 Responses 格式。
-                if let Some(rc) = m.get("reasoning_content").and_then(|r| r.as_str()) {
-                    if !rc.is_empty() {
-                        msg["reasoning_content"] = json!(rc);
-                    }
-                }
-                items.push(msg);
+                items.push(json!({"type": "message", "role": "assistant", "content": parts}));
             }
             for tc in m["tool_calls"].as_array().unwrap_or(&vec![]) {
                 let f = tc.get("function").cloned().unwrap_or(json!({}));
@@ -437,6 +447,21 @@ fn convert_messages(messages: &Value) -> Vec<Value> {
             Some(v) => v.clone(),
             None => Value::Null,
         };
+        // DeepSeek thinking mode：assistant 的 reasoning 作为独立 item 传回。
+        // 仅有 reasoning 的轮次（content 为空）不再补一条空 message，避免上游拒绝。
+        if role == "assistant" {
+            if let Some(rc) = m.get("reasoning_content").and_then(|r| r.as_str()) {
+                if !rc.is_empty() {
+                    items.push(reasoning_item(rc));
+                    if matches!(&converted, Value::Null)
+                        || matches!(&converted, Value::String(s) if s.is_empty())
+                        || matches!(&converted, Value::Array(a) if a.is_empty())
+                    {
+                        continue;
+                    }
+                }
+            }
+        }
         items.push(json!({"type": "message", "role": role, "content": converted}));
     }
     items
@@ -3484,6 +3509,70 @@ fn test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod channel_routing_tests {
     use super::*;
+
+    /// 回归保护：assistant 的 `reasoning_content` 曾被当成 message 上的一个字段，
+    /// 上游识别不到，报 400 `The reasoning_text ... must be passed back`。
+    /// 正确做法是还原为独立的 reasoning item，且排在对应 message 之前。
+    #[test]
+    fn chat_reasoning_content_becomes_reasoning_item_before_message() {
+        let messages = json!([
+            {"role": "user", "content": "1+1=?"},
+            {"role": "assistant", "content": "2", "reasoning_content": "先分析进位"}
+        ]);
+
+        let items = convert_messages(&messages);
+        let ri = items
+            .iter()
+            .position(|i| i.get("type").and_then(|t| t.as_str()) == Some("reasoning"))
+            .expect("缺少 reasoning item");
+        assert_eq!(
+            items[ri].pointer("/content/0/type").and_then(|t| t.as_str()),
+            Some("reasoning_text")
+        );
+        assert_eq!(
+            items[ri].pointer("/content/0/text").and_then(|t| t.as_str()),
+            Some("先分析进位")
+        );
+        let mi = items
+            .iter()
+            .position(|i| {
+                i.get("type").and_then(|t| t.as_str()) == Some("message")
+                    && i.get("role").and_then(|r| r.as_str()) == Some("assistant")
+            })
+            .expect("缺少 assistant message");
+        assert!(ri < mi, "reasoning item 必须排在对应 assistant message 之前");
+    }
+
+    /// 与上一条互补：带 tool_calls 的 assistant 轮次，reasoning item 也要传回，
+    /// 且要排在 function_call 之前。
+    #[test]
+    fn chat_reasoning_with_tool_calls_becomes_reasoning_item_before_function_call() {
+        let messages = json!([{
+            "role": "assistant",
+            "content": null,
+            "reasoning_content": "需要调用工具",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\"SH\"}"}
+            }]
+        }]);
+
+        let items = convert_messages(&messages);
+        let ri = items
+            .iter()
+            .position(|i| i.get("type").and_then(|t| t.as_str()) == Some("reasoning"))
+            .expect("缺少 reasoning item");
+        let fi = items
+            .iter()
+            .position(|i| i.get("type").and_then(|t| t.as_str()) == Some("function_call"))
+            .expect("缺少 function_call item");
+        assert!(ri < fi, "reasoning item 必须排在 function_call 之前");
+        assert!(
+            items.iter().all(|i| i.get("reasoning_content").is_none()),
+            "reasoning_content 不应再作为 message 字段残留"
+        );
+    }
 
     /// 见 `TEST_LOCK` 的说明：串行化对进程级单例的访问
     fn lock() -> std::sync::MutexGuard<'static, ()> {
