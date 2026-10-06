@@ -288,16 +288,21 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 清理历史遗留的带版本号资源，避免 latest 里越堆越多。
+      # 清理历史遗留的带版本号资源（如 Token.Monitor_0.1.17_x64-setup.exe），
+      # 否则用户会误装旧构建，却发现版本号与 latest 相同。
+      # 本 job 没有 actions/checkout，gh 无法从 cwd 推断仓库，必须显式 --repo，
+      # 并开启 pipefail 让 gh 失败时不再静默跳过清理。
       - name: Prune stale assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -uo pipefail
+          repo="${{ github.repository }}"
           keep="token-monitor_windows-x64.exe token-monitor_macos-x64.dmg token-monitor_macos-arm64.dmg token-monitor_linux-x86_64.AppImage token-monitor_linux-x86_64.deb token-monitor_linux-aarch64.AppImage token-monitor_linux-aarch64.deb"
-          gh release view latest --json assets --jq '.assets[].name' | while read -r name; do
+          gh release view latest --repo "$repo" --json assets --jq '.assets[].name' | while read -r name; do
             [ -z "$name" ] && continue
             case " $keep " in
               *" $name "*) ;;
-              *) echo "delete stale asset: $name"; gh release delete-asset latest "$name" --yes ;;
+              *) echo "delete stale asset: $name"; gh release delete-asset latest "$name" --repo "$repo" --yes ;;
             esac
           done
