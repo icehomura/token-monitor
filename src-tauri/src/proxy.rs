@@ -1005,11 +1005,23 @@ fn anthropic_to_chat_payload(body: &Value, stream: bool, model_override: &str) -
                     let mut text_parts = Vec::new();
                     let mut tool_calls = Vec::new();
                     let mut tool_results = Vec::new();
+                    let mut reasoning = String::new();
                     for b in blocks {
                         match b.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                             "text" => {
                                 if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
                                     if !t.is_empty() { text_parts.push(t.to_string()); }
+                                }
+                            }
+                            // Anthropic 的 thinking 块 -> Chat 的 assistant.reasoning_content。
+                            // 不回传则 DeepSeek thinking mode 上游报 400
+                            // `The reasoning_text in the thinking mode must be passed back`。
+                            "thinking" => {
+                                if let Some(t) = b.get("thinking").and_then(|t| t.as_str()) {
+                                    if !t.is_empty() {
+                                        if !reasoning.is_empty() { reasoning.push('\n'); }
+                                        reasoning.push_str(t);
+                                    }
                                 }
                             }
                             "tool_use" => {
@@ -1047,6 +1059,10 @@ fn anthropic_to_chat_payload(body: &Value, stream: bool, model_override: &str) -
                             msg["tool_calls"] = Value::Array(tool_calls);
                         } else {
                             msg["content"] = json!(text_parts.join("\n"));
+                        }
+                        // reasoning 必须挂在 assistant 消息上原样回传。
+                        if !reasoning.is_empty() {
+                            msg["reasoning_content"] = json!(reasoning);
                         }
                         messages.push(msg);
                     }
