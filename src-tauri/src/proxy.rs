@@ -2105,6 +2105,16 @@ async fn stream_chat_to_responses(
 
             if let Some(ref cb) = on_tokens { cb(out_chars); }
 
+            // DeepSeek thinking mode：Chat 的 reasoning_content delta -> Responses 的
+            // response.reasoning.delta。不转出去客户端就无从知道要原样回传什么。
+            if let Some(rc) = obj.pointer("/choices/0/delta/reasoning_content").and_then(|r| r.as_str()) {
+                if !rc.is_empty() {
+                    let _ = tx.send(Ok(sse_frame(&json!({
+                        "type": "response.reasoning.delta",
+                        "delta": rc,
+                    })))).await;
+                }
+            }
             // 文本 delta
             if let Some(content) = obj.pointer("/choices/0/delta/content").and_then(|c| c.as_str()) {
                 if !text_started {
