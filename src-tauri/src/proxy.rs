@@ -1106,6 +1106,21 @@ fn anthropic_to_chat_payload(body: &Value, stream: bool, model_override: &str) -
 
 // ---------- 参数转换：Responses API -> Anthropic Messages ----------
 
+/// 追加一条 Anthropic assistant 消息：若上一条已经是 assistant（典型场景是刚由
+/// reasoning item 生成的、只含 thinking 块的消息），则把内容块并入其中。
+/// Anthropic 要求 role 交替，连续两条 assistant 消息会被上游拒绝。
+fn push_anthropic_assistant(messages: &mut Vec<Value>, blocks: Vec<Value>) {
+    if let Some(last) = messages.last_mut() {
+        if last.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            if let Some(Value::Array(existing)) = last.get_mut("content") {
+                existing.extend(blocks);
+                return;
+            }
+        }
+    }
+    messages.push(json!({"role": "assistant", "content": blocks}));
+}
+
 /// Responses API -> Anthropic Messages payload
 fn responses_to_anthropic_payload(body: &Value, stream: bool, model_override: &str) -> Value {
     let mut system_text = String::new();
@@ -1134,8 +1149,35 @@ fn responses_to_anthropic_payload(body: &Value, stream: bool, model_override: &s
                     if role == "system" {
                         if !system_text.is_empty() { system_text.push('\n'); }
                         system_text.push_str(&text);
+                    } else if role == "assistant" {
+                        push_anthropic_assistant(
+                            &mut messages,
+                            vec![json!({"type": "text", "text": text})],
+                        );
                     } else {
                         messages.push(json!({"role": role, "content": text}));
+                    }
+                }
+                // DeepSeek thinking mode：Responses 的 reasoning item 在 Anthropic
+                // 格式里是 thinking 内容块，必须回传否则上游报 400
+                // `The reasoning_text in the thinking mode must be passed back`。
+                "reasoning" => {
+                    let text = item
+                        .get("content")
+                        .and_then(|c| c.as_array())
+                        .map(|blocks| {
+                            blocks
+                                .iter()
+                                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("")
+                        })
+                        .unwrap_or_default();
+                    if !text.is_empty() {
+                        push_anthropic_assistant(
+                            &mut messages,
+                            vec![json!({"type": "thinking", "thinking": text})],
+                        );
                     }
                 }
                 "function_call" => {
@@ -1143,15 +1185,15 @@ fn responses_to_anthropic_payload(body: &Value, stream: bool, model_override: &s
                         .and_then(|a| a.as_str())
                         .and_then(|a| serde_json::from_str(a).ok())
                         .unwrap_or(json!({}));
-                    messages.push(json!({
-                        "role": "assistant",
-                        "content": [{
+                    push_anthropic_assistant(
+                        &mut messages,
+                        vec![json!({
                             "type": "tool_use",
                             "id": item.get("call_id").and_then(|c| c.as_str()).unwrap_or(""),
                             "name": item.get("name").and_then(|n| n.as_str()).unwrap_or(""),
                             "input": input,
-                        }],
-                    }));
+                        })],
+                    );
                 }
                 "function_call_output" => {
                     let output = item.get("output").and_then(|o| o.as_str()).unwrap_or("");
