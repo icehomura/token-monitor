@@ -592,6 +592,17 @@ fn anthropic_to_responses_payload(body: &Value, stream: bool, model_override: &s
                                     }));
                                 }
                             }
+                            // Anthropic 的 thinking 块 -> Responses 的 reasoning item。
+                            // DeepSeek thinking mode 要求把上一轮 reasoning 原样传回，
+                            // 丢了这一块上游就报 400
+                            // `The reasoning_text in the thinking mode must be passed back`。
+                            // 块顺序天然保证 reasoning item 排在 assistant 文本之前。
+                            "thinking" => {
+                                let text = b.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
+                                if !text.is_empty() {
+                                    items.push(reasoning_item(text));
+                                }
+                            }
                             "tool_use" => {
                                 items.push(json!({
                                     "type": "function_call",
