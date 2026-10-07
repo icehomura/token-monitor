@@ -1801,6 +1801,15 @@ async fn passthrough_anthropic_stream(
 fn chat_to_responses(v: &Value, model: &str) -> Value {
     let msg = v.pointer("/choices/0/message").cloned().unwrap_or(json!({}));
     let mut output_items = Vec::new();
+    // DeepSeek thinking mode：Chat 的 assistant.reasoning_content 在 Responses
+    // 格式里是独立的 reasoning output item。不回传给客户端，客户端就无从知道
+    // 自己应该把什么原样送回，下一轮一旦路由到 thinking 上游就会 400
+    // `The reasoning_text in the thinking mode must be passed back`。
+    if let Some(rc) = msg.get("reasoning_content").and_then(|r| r.as_str()) {
+        if !rc.is_empty() {
+            output_items.push(reasoning_item(rc));
+        }
+    }
     if let Some(t) = msg.get("content").and_then(|c| c.as_str()) {
         if !t.is_empty() {
             output_items.push(json!({
