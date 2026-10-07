@@ -1,12 +1,12 @@
 <template>
   <section class="chart-box">
-    <h2>RPM / 输出·输入·缓存词元</h2>
+    <h2>RPM / 输出·输入(未缓存)·缓存词元</h2>
     <div ref="chartRef" class="chart"></div>
   </section>
 </template>
 
 <script setup>
-import { ref, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { fmtTokens } from '../utils/format'
 // echarts 按需导入，避免全量打包 ~1MB
 import * as echarts from 'echarts/core'
@@ -34,6 +34,13 @@ const props = defineProps({
 
 const chartRef = ref(null)
 let chart = null
+
+// “输入”线展示的是**未缓存输入**：上游上报的输入词元里已经把命中缓存的部分算在内
+// （Anthropic 的 input_tokens 含 cache_read_input_tokens），直接画会和“缓存”线高度
+// 重合，看起来像多算了一笔。这里逐点做差，与概览卡片的“输入 TPM”口径保持一致。
+const uncachedInputTpms = computed(() =>
+  (props.inputTpms || []).map((v, i) => Math.max(0, (v || 0) - (props.cachedTpms?.[i] || 0))),
+)
 
 function axis() {
   const tc = themeColors.value
@@ -171,7 +178,7 @@ function renderChart() {
           areaStyle: grad(tc.green),
         },
         {
-          name: '输入', type: 'line', yAxisIndex: 2, data: props.inputTpms,
+          name: '输入', type: 'line', yAxisIndex: 2, data: uncachedInputTpms.value,
           smooth: true, symbol: 'circle', symbolSize: 4,
           lineStyle: { color: tc.blue, width: 2.4 },
           itemStyle: { color: tc.blue },

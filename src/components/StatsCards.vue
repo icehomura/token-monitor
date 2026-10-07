@@ -6,7 +6,7 @@
         <div class="tok-grid">
           <div class="tok-cell tok-input">
             <span class="tok-label">输入 TPM</span>
-            <span class="tok-num">{{ fmtTokens(Math.max(0, currentInputTpm - currentCachedTpm), convertUnits) }}</span>
+            <span class="tok-num">{{ fmtTokens(currentUncachedInputTpm, convertUnits) }}</span>
           </div>
           <div class="tok-cell tok-output">
             <span class="tok-label">输出 TPM</span>
@@ -116,9 +116,16 @@ const currentOutputTpm = computed(() => {
   return arr[arr.length - 1] || 0
 })
 
+/// 未缓存输入 TPM：上游上报的输入词元把命中缓存的部分也算在内，展示时逐项做差，
+/// 否则“输入”与“缓存”两条曲线会几乎重合，看起来像多算了一笔。
+const currentUncachedInputTpm = computed(() =>
+  Math.max(0, currentInputTpm.value - currentCachedTpm.value),
+)
+
 const currentTotalTpm = computed(() => {
-  // 合计 = 原始输入（含缓存）+ 输出
-  return currentInputTpm.value + currentOutputTpm.value
+  // 合计 = 未缓存输入 + 输出，与「词元数明细」的 consumedTokens 口径一致。
+  // 不能再加 cached：输入里已经含过缓存了，加一遍就是重复计数。
+  return currentUncachedInputTpm.value + currentOutputTpm.value
 })
 
 const uncachedInputTokens = computed(() => {
