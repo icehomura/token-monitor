@@ -899,10 +899,28 @@ fn chat_to_anthropic_payload(body: &Value, stream: bool, model_override: &str) -
                     .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
                     .collect::<Vec<_>>()
                     .join("\n"),
-                _ => continue,
+                _ => String::new(),
             };
-            if !text.is_empty() {
-                messages.push(json!({"role": role, "content": text}));
+            // DeepSeek thinking mode：assistant 的 reasoning_content 在 Anthropic
+            // 格式里是 thinking 内容块，必须随下一轮回传，否则上游报 400
+            // `The reasoning_text in the thinking mode must be passed back`。
+            // 注意 content 为空但带 reasoning_content 的轮次也要发出去 ——
+            // 旧实现会因 content 缺失直接 continue，把这一轮 reasoning 丢掉。
+            let reasoning = if role == "assistant" {
+                m.get("reasoning_content").and_then(|r| r.as_str()).unwrap_or("")
+            } else {
+                ""
+            };
+            if reasoning.is_empty() {
+                if !text.is_empty() {
+                    messages.push(json!({"role": role, "content": text}));
+                }
+            } else {
+                let mut blocks = vec![json!({"type": "thinking", "thinking": reasoning})];
+                if !text.is_empty() {
+                    blocks.push(json!({"type": "text", "text": text}));
+                }
+                messages.push(json!({"role": "assistant", "content": blocks}));
             }
         }
     }
