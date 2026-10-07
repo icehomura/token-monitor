@@ -123,9 +123,10 @@ const currentUncachedInputTpm = computed(() =>
 )
 
 const currentTotalTpm = computed(() => {
-  // 合计 = 未缓存输入 + 输出，与「词元数明细」的 consumedTokens 口径一致。
-  // 不能再加 cached：输入里已经含过缓存了，加一遍就是重复计数。
-  return currentUncachedInputTpm.value + currentOutputTpm.value
+  // 合计 = 输入（含缓存）+ 输出，与后端 TPM 限流的口径一致（`tc.input + tc.output`）。
+  // 缓存只是输入的一个子集，不能单独再加一遍；同时这个值恰好等于卡片上
+  // 「输入 TPM + 输出 TPM + 缓存 TPM」，用户一眼能对得上。
+  return currentUncachedInputTpm.value + currentCachedTpm.value + currentOutputTpm.value
 })
 
 const uncachedInputTokens = computed(() => {
@@ -135,8 +136,11 @@ const uncachedInputTokens = computed(() => {
 })
 
 const consumedTokens = computed(() => {
+  // 同「当前分钟」的合计口径：输入（含缓存）+ 输出，等于本卡片三个数字之和。
+  // 缓存不算两次，但也不能漏：它就是输入里命中缓存的那一部分。
+  const input = props.stats.inputTokens || 0
   const output = props.stats.outputTokens || 0
-  return uncachedInputTokens.value + output
+  return input + output
 })
 
 // 窗口内平均请求数/分钟（四舍五入取整）
