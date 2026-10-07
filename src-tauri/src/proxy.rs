@@ -3728,6 +3728,214 @@ mod channel_routing_tests {
         );
     }
 
+    /// 回归保护：Anthropic 客户端的 thinking 块在切到 Responses 上游时曾被整块丢弃，
+    /// 上游于是报 400 `The reasoning_text ... must be passed back`。
+    #[test]
+    fn anthropic_thinking_block_becomes_reasoning_input_item() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "1+1=?"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "先分析进位", "signature": "sig"},
+                    {"type": "text", "text": "2"}
+                ]}
+            ]
+        });
+
+        let payload = anthropic_to_responses_payload(&body, false, "");
+        let items = payload.get("input").and_then(|i| i.as_array()).unwrap();
+        let ri = items
+            .iter()
+            .position(|i| i.get("type").and_then(|t| t.as_str()) == Some("reasoning"))
+            .expect("缺少 reasoning item");
+        assert_eq!(
+            items[ri].pointer("/content/0/type").and_then(|t| t.as_str()),
+            Some("reasoning_text")
+        );
+        assert_eq!(
+            items[ri].pointer("/content/0/text").and_then(|t| t.as_str()),
+            Some("先分析进位")
+        );
+        let mi = items
+            .iter()
+            .position(|i| {
+                i.get("type").and_then(|t| t.as_str()) == Some("message")
+                    && i.get("role").and_then(|r| r.as_str()) == Some("assistant")
+            })
+            .expect("缺少 assistant message");
+        assert!(ri < mi, "reasoning item 必须排在 assistant message 之前");
+    }
+
+    /// Chat -> Anthropic 上游：不带 tool_calls 的 assistant 轮次也要带上 thinking 块，
+    /// 且 content 为空、只有 reasoning_content 的轮次不能被整轮丢掉。
+    #[test]
+    fn chat_reasoning_without_tool_calls_becomes_anthropic_thinking_block() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "assistant", "content": "2", "reasoning_content": "先分析进位"},
+                {"role": "assistant", "content": null, "reasoning_content": "只有推理"}
+            ]
+        });
+
+        let payload = chat_to_anthropic_payload(&body, false, "");
+        let msgs = payload.get("messages").and_then(|m| m.as_array()).unwrap();
+        assert_eq!(msgs.len(), 2, "content 为空的 reasoning 轮次不能丢");
+        let blocks = msgs[0].get("content").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(blocks[0].get("type").and_then(|t| t.as_str()), Some("thinking"));
+        assert_eq!(
+            blocks[0].get("thinking").and_then(|t| t.as_str()),
+            Some("先分析进位")
+        );
+        assert_eq!(blocks[1].get("type").and_then(|t| t.as_str()), Some("text"));
+        assert_eq!(blocks[1].get("text").and_then(|t| t.as_str()), Some("2"));
+        let blocks2 = msgs[1].get("content").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(blocks2.len(), 1);
+        assert_eq!(blocks2[0].get("type").and_then(|t| t.as_str()), Some("thinking"));
+    }
+
+    /// Anthropic -> Chat 上游：thinking 块要变成 assistant.reasoning_content。
+    #[test]
+    fn anthropic_thinking_block_becomes_chat_reasoning_content() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "先分析进位"},
+                {"type": "text", "text": "2"}
+            ]}]
+        });
+
+        let payload = anthropic_to_chat_payload(&body, false, "");
+        let msgs = payload.get("messages").and_then(|m| m.as_array()).unwrap();
+        assert_eq!(
+            msgs[0].get("reasoning_content").and_then(|r| r.as_str()),
+            Some("先分析进位")
+        );
+        assert_eq!(msgs[0].get("content").and_then(|c| c.as_str()), Some("2"));
+    }
+
+    /// Responses -> Anthropic 上游：reasoning item 要变成 thinking 块，
+    /// 并与同一轮的文本合并成一条消息（Anthropic 不允许连续两条 assistant）。
+    #[test]
+    fn responses_reasoning_item_becomes_anthropic_thinking_block() {
+        let body = json!({
+            "model": "m",
+            "input": [
+                {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "先分析进位"}]},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "2"}]}
+            ]
+        });
+
+        let payload = responses_to_anthropic_payload(&body, false, "");
+        let msgs = payload.get("messages").and_then(|m| m.as_array()).unwrap();
+        assert_eq!(msgs.len(), 1, "thinking 与文本必须合并为同一条 assistant 消息");
+        let blocks = msgs[0].get("content").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(blocks[0].get("type").and_then(|t| t.as_str()), Some("thinking"));
+        assert_eq!(
+            blocks[0].get("thinking").and_then(|t| t.as_str()),
+            Some("先分析进位")
+        );
+        assert_eq!(blocks[1].get("type").and_then(|t| t.as_str()), Some("text"));
+        assert_eq!(blocks[1].get("text").and_then(|t| t.as_str()), Some("2"));
+    }
+
+    /// 响应侧：Chat 上游的 reasoning_content 必须变成 Responses 的 reasoning item，
+    /// 否则客户端根本不知道该回传什么，动态切到 thinking 上游时才报 400。
+    #[test]
+    fn chat_response_reasoning_becomes_responses_reasoning_item() {
+        let v = json!({"choices": [{"message": {
+            "role": "assistant", "content": "2", "reasoning_content": "先分析进位"
+        }}]});
+
+        let out = chat_to_responses(&v, "m");
+        let items = out.get("output").and_then(|o| o.as_array()).unwrap();
+        assert_eq!(items[0].get("type").and_then(|t| t.as_str()), Some("reasoning"));
+        assert_eq!(
+            items[0].pointer("/content/0/type").and_then(|t| t.as_str()),
+            Some("reasoning_text")
+        );
+        assert_eq!(
+            items[0].pointer("/content/0/text").and_then(|t| t.as_str()),
+            Some("先分析进位")
+        );
+        assert_eq!(items[1].get("type").and_then(|t| t.as_str()), Some("message"));
+    }
+
+    /// 响应侧：Anthropic 上游的 thinking 块 -> Responses 的 reasoning item。
+    #[test]
+    fn anthropic_response_thinking_becomes_responses_reasoning_item() {
+        let v = json!({"content": [
+            {"type": "thinking", "thinking": "先分析进位"},
+            {"type": "text", "text": "2"}
+        ]});
+
+        let out = anthropic_to_responses(&v, "m");
+        let items = out.get("output").and_then(|o| o.as_array()).unwrap();
+        assert_eq!(items[0].get("type").and_then(|t| t.as_str()), Some("reasoning"));
+        assert_eq!(
+            items[0].pointer("/content/0/text").and_then(|t| t.as_str()),
+            Some("先分析进位")
+        );
+        assert_eq!(items[1].get("type").and_then(|t| t.as_str()), Some("message"));
+    }
+
+    /// 响应侧：Anthropic 上游的 thinking 块 -> Chat 的 assistant.reasoning_content。
+    #[test]
+    fn anthropic_response_thinking_becomes_chat_reasoning_content() {
+        let v = json!({
+            "content": [
+                {"type": "thinking", "thinking": "先分析进位"},
+                {"type": "text", "text": "2"}
+            ],
+            "stop_reason": "end_turn"
+        });
+
+        let out = anthropic_to_chat(&v);
+        let msg = out.pointer("/choices/0/message").unwrap();
+        assert_eq!(
+            msg.get("reasoning_content").and_then(|r| r.as_str()),
+            Some("先分析进位")
+        );
+        assert_eq!(msg.get("content").and_then(|c| c.as_str()), Some("2"));
+    }
+
+    /// 端到端回归：reasoning 必须在「客户端 <-> 上游」之间双向存活。
+    /// 中途任一环节丢掉，用户「动态切换渠道」后的请求就会被 thinking 上游 400 拒绝：
+    /// `The reasoning_text in the thinking mode must be passed back to the API.`
+    #[test]
+    fn reasoning_round_trips_from_chat_upstream_back_to_responses_upstream() {
+        let upstream_chat = json!({"choices": [{"message": {
+            "role": "assistant", "content": "2", "reasoning_content": "先分析进位"
+        }}]});
+
+        // 1) 上游 Chat -> 客户端 Responses：客户端拿到 reasoning item
+        let as_responses = chat_to_responses(&upstream_chat, "m");
+
+        // 2) 客户端把 reasoning item 原样带回（Responses 入参）-> Chat
+        let back = json!({"model": "m", "input": as_responses.get("output").unwrap()});
+        let chat = responses_to_chat_payload(&back, false, "");
+        let msg = &chat["messages"][0];
+        assert_eq!(
+            msg.get("reasoning_content").and_then(|r| r.as_str()),
+            Some("先分析进位")
+        );
+
+        // 3) 再转回 Responses 上游：reasoning item 必须重新出现
+        let payload = chat_to_responses_payload(
+            &json!({"model": "m", "messages": [msg.clone()]}),
+            false,
+            "",
+        );
+        let items = payload.get("input").and_then(|i| i.as_array()).unwrap();
+        assert_eq!(items[0].get("type").and_then(|t| t.as_str()), Some("reasoning"));
+        assert_eq!(
+            items[0].pointer("/content/0/text").and_then(|t| t.as_str()),
+            Some("先分析进位")
+        );
+    }
+
     /// 见 `TEST_LOCK` 的说明：串行化对进程级单例的访问
     fn lock() -> std::sync::MutexGuard<'static, ()> {
         test_lock()
@@ -4761,6 +4969,107 @@ mod channel_routing_tests {
 
         sched.remove_channel("anth-ch");
         remove_channel_config("anth-ch");
+    }
+
+    /// 回归保护：Anthropic 上游的 `thinking_delta` 必须转成 Chat 的
+    /// `reasoning_content` delta 发出去。之前这条流只认 `delta.text`，
+    /// thinking 被整段吞掉——客户端手里没有 reasoning，之后动态切到
+    /// thinking 上游时必然收到 400
+    /// `The reasoning_text in the thinking mode must be passed back to the API.`
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_chat_with_anthropic_upstream_emits_reasoning_content() {
+        use tower::ServiceExt;
+
+        let _g = lock();
+        let sched = init_scheduler();
+
+        let frames = [
+            json!({"type":"message_start","message":{"usage":{"input_tokens":3}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"先分析进位"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"2"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}),
+            json!({"type":"message_stop"}),
+        ];
+        let sse: &'static str = Box::leak(
+            frames
+                .iter()
+                .map(|f| format!("data: {f}\n\n"))
+                .collect::<String>()
+                .into_boxed_str(),
+        );
+
+        let upstream = Router::new().route(
+            "/v1/messages",
+            post(move || async move {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    sse,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+
+        sched.upsert_channel("think-ch", true, 4, 0, 0, 100);
+        set_channel_config(
+            "think-ch",
+            ChannelConfig {
+                api_key: "sk-think".into(),
+                upstream_url: format!("http://{addr}/v1/messages"),
+                upstream_format: UpstreamFormat::Anthropic,
+                model_override: String::new(),
+            },
+        );
+
+        let resp = build_router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "m",
+                            "messages": [{"role": "user", "content": "1+1=?"}],
+                            "stream": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        let deltas: Vec<Value> = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|p| serde_json::from_str::<Value>(p).ok())
+            .filter_map(|e| e.pointer("/choices/0/delta").cloned())
+            .collect();
+
+        assert!(
+            deltas.iter().any(|d| d
+                .get("reasoning_content")
+                .and_then(|r| r.as_str())
+                == Some("先分析进位")),
+            "thinking_delta 未转成 reasoning_content delta：{body}"
+        );
+        assert!(
+            deltas.iter().any(|d| d.get("content").and_then(|c| c.as_str()) == Some("2")),
+            "正文 delta 丢失：{body}"
+        );
+
+        sched.remove_channel("think-ch");
+        remove_channel_config("think-ch");
     }
 
     /// `find_sse_boundary` 必须识别 SSE 规范允许的全部三种行结束符
