@@ -1752,6 +1752,16 @@ async fn passthrough_chat_stream(
     (out_chars, usage)
 }
 
+/// Anthropic 的 `input_tokens` **不包含**缓存读写（`cache_read_input_tokens` /
+/// `cache_creation_input_tokens` 是与之并列的字段），而 Chat 的 `prompt_tokens` 与
+/// Responses 的 `input_tokens` **已经包含**缓存。统计表只有一列 `input`，前端再按
+/// `input - cached` 求「未缓存输入」，所以这里必须把缓存并进 `input`：既让三种格式口径
+/// 一致，也避免 Anthropic 渠道的输入被整段少算。
+fn anthropic_total_input_tokens(u: &Value) -> u64 {
+    let n = |p: &str| u.pointer(p).and_then(|t| t.as_u64()).unwrap_or(0);
+    n("/input_tokens") + n("/cache_read_input_tokens") + n("/cache_creation_input_tokens")
+}
+
 /// 上游 Anthropic SSE 直通到客户端 Anthropic Messages（+ token 统计）
 async fn passthrough_anthropic_stream(
     upstream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
@@ -1784,7 +1794,7 @@ async fn passthrough_anthropic_stream(
                         }
                     } else if evt_type == "message_start" {
                         if let Some(u) = obj.pointer("/message/usage") {
-                            usage.input = u.pointer("/input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                            usage.input = anthropic_total_input_tokens(u);
                             usage.cached = u.pointer("/cache_read_input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
                         }
                     }
@@ -2234,7 +2244,7 @@ async fn stream_anthropic_to_responses(
                     }
                     "message_start" => {
                         if let Some(u) = obj.pointer("/message/usage") {
-                            usage.input = u.pointer("/input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                            usage.input = anthropic_total_input_tokens(u);
                             usage.cached = u.pointer("/cache_read_input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
                         }
                     }
@@ -2542,7 +2552,7 @@ async fn stream_anthropic_to_chat(
                 }
                 "message_start" => {
                     if let Some(u) = obj.pointer("/message/usage") {
-                        usage.input = u.pointer("/input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                        usage.input = anthropic_total_input_tokens(u);
                         usage.cached = u.pointer("/cache_read_input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
                     }
                 }
@@ -3231,10 +3241,11 @@ async fn chat_completions(
             // 上游返回 Anthropic 格式 -> 转为 Chat Completions
             let full = upstream.text().await.unwrap_or_default();
             let v = serde_json::from_str::<Value>(&full).unwrap_or(json!({}));
+            let u = v.get("usage").cloned().unwrap_or(json!({}));
             let tc = stats::TokenCounts {
-                input: v.pointer("/usage/input_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
-                output: v.pointer("/usage/output_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
-                cached: 0,
+                input: anthropic_total_input_tokens(&u),
+                output: u.pointer("/output_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+                cached: u.pointer("/cache_read_input_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
             };
             let cc = anthropic_to_chat(&v);
             let total_tokens = tc.input + tc.output;
@@ -3934,6 +3945,26 @@ mod channel_routing_tests {
             items[0].pointer("/content/0/text").and_then(|t| t.as_str()),
             Some("先分析进位")
         );
+    }
+
+    /// Anthropic 的 `input_tokens` 不含缓存，统计口径必须并上缓存读/写，
+    /// 才能与 Chat/Responses（已含缓存）对齐；否则前端「输入 - 缓存」会把
+    /// Anthropic 渠道的未缓存输入算成负数、被 `max(0, …)` 截成 0。
+    #[test]
+    fn anthropic_input_tokens_are_normalized_to_include_cache() {
+        let u = json!({
+            "input_tokens": 100,
+            "cache_read_input_tokens": 900,
+            "cache_creation_input_tokens": 50,
+            "output_tokens": 7
+        });
+        assert_eq!(anthropic_total_input_tokens(&u), 1050);
+        // 没有缓存字段时保持原值
+        assert_eq!(
+            anthropic_total_input_tokens(&json!({"input_tokens": 12})),
+            12
+        );
+        assert_eq!(anthropic_total_input_tokens(&json!({})), 0);
     }
 
     /// 见 `TEST_LOCK` 的说明：串行化对进程级单例的访问
