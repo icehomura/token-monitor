@@ -1892,9 +1892,19 @@ fn anthropic_to_responses(v: &Value, model: &str) -> Value {
 fn anthropic_to_chat(v: &Value) -> Value {
     let mut content_parts = Vec::new();
     let mut tool_calls = Vec::new();
+    // DeepSeek thinking mode：Anthropic 的 thinking 块 -> Chat 的
+    // assistant.reasoning_content，必须让客户端拿到才能在下一轮回传。
+    let mut reasoning_text = String::new();
     if let Some(content) = v.get("content").and_then(|c| c.as_array()) {
         for block in content {
             match block.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "thinking" => {
+                    let t = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
+                    if !t.is_empty() {
+                        if !reasoning_text.is_empty() { reasoning_text.push('\n'); }
+                        reasoning_text.push_str(t);
+                    }
+                }
                 "text" => {
                     let t = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
                     if !t.is_empty() { content_parts.push(t.to_string()); }
@@ -1920,6 +1930,9 @@ fn anthropic_to_chat(v: &Value) -> Value {
         "role": "assistant",
         "content": if text.is_empty() { Value::Null } else { json!(text) },
     });
+    if !reasoning_text.is_empty() {
+        message["reasoning_content"] = json!(reasoning_text);
+    }
     if !tool_calls.is_empty() {
         message["tool_calls"] = Value::Array(tool_calls);
     }
