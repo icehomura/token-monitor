@@ -2190,6 +2190,16 @@ async fn stream_anthropic_to_responses(
                 if let Some(ref cb) = on_tokens { cb(out_chars); }
                 match evt_type {
                     "content_block_delta" => {
+                        // DeepSeek thinking mode：Anthropic 的 thinking_delta ->
+                        // Responses 的 response.reasoning.delta。
+                        if obj.pointer("/delta/type").and_then(|t| t.as_str()) == Some("thinking_delta") {
+                            if let Some(t) = obj.pointer("/delta/thinking").and_then(|t| t.as_str()) {
+                                let _ = tx.send(Ok(sse_frame(&json!({
+                                    "type": "response.reasoning.delta",
+                                    "delta": t,
+                                })))).await;
+                            }
+                        }
                         // 文本 delta -> Responses output_text.delta
                         if let Some(d) = obj.pointer("/delta/text").and_then(|t| t.as_str()) {
                             out_chars += d.chars().count() as u64;
