@@ -2490,6 +2490,13 @@ async fn stream_anthropic_to_chat(
             match evt_type {
                 "content_block_delta" => {
                     send_role!();
+                    // DeepSeek thinking mode：Anthropic 的 thinking_delta -> Chat 的
+                    // reasoning_content delta，客户端据此在下一轮回传 reasoning。
+                    if obj.pointer("/delta/type").and_then(|t| t.as_str()) == Some("thinking_delta") {
+                        if let Some(t) = obj.pointer("/delta/thinking").and_then(|t| t.as_str()) {
+                            let _ = tx.send(Ok(sse_frame(&make_chunk(&model, json!({"reasoning_content": t}), None)))).await;
+                        }
+                    }
                     if let Some(d) = obj.pointer("/delta/text").and_then(|t| t.as_str()) {
                         out_chars += d.chars().count() as u64;
                         let _ = tx.send(Ok(sse_frame(&make_chunk(&model, json!({"content": d}), None)))).await;
