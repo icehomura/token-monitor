@@ -1846,6 +1846,14 @@ fn anthropic_to_responses(v: &Value, model: &str) -> Value {
     if let Some(content) = v.get("content").and_then(|c| c.as_array()) {
         for block in content {
             match block.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                // DeepSeek thinking mode：Anthropic 的 thinking 块 -> Responses 的
+                // reasoning output item，必须让客户端拿到才能在下一轮回传。
+                "thinking" => {
+                    let t = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
+                    if !t.is_empty() {
+                        output_items.push(reasoning_item(t));
+                    }
+                }
                 "text" => {
                     let t = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
                     if !t.is_empty() {
